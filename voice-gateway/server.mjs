@@ -11,15 +11,16 @@ const internalKey = process.env.INTERNAL_API_KEY || "";
 const pendingCalls = new Map();
 const liveCalls = new Map();
 
+// Токен: agentId.tenantId.expiresAt.signature — тенант возвращаем строкой.
 function validBrowserToken(token, agentId) {
   const parts = String(token || "").split(".");
-  if (parts.length !== 3 || parts[0] !== agentId || !internalKey) return false;
-  const expiresAt = Number(parts[1]);
-  if (!Number.isFinite(expiresAt) || expiresAt < Math.floor(Date.now() / 1000)) return false;
-  const expected = createHmac("sha256", internalKey).update(`${parts[0]}.${parts[1]}`).digest("base64url");
-  const actualBuffer = Buffer.from(parts[2]);
+  if (parts.length !== 4 || parts[0] !== agentId || !internalKey) return null;
+  const expiresAt = Number(parts[2]);
+  if (!Number.isFinite(expiresAt) || expiresAt < Math.floor(Date.now() / 1000)) return null;
+  const expected = createHmac("sha256", internalKey).update(`${parts[0]}.${parts[1]}.${parts[2]}`).digest("base64url");
+  const actualBuffer = Buffer.from(parts[3]);
   const expectedBuffer = Buffer.from(expected);
-  return actualBuffer.length === expectedBuffer.length && timingSafeEqual(actualBuffer, expectedBuffer);
+  return actualBuffer.length === expectedBuffer.length && timingSafeEqual(actualBuffer, expectedBuffer) ? parts[1] : null;
 }
 
 function log(message, details = "") {
@@ -39,7 +40,8 @@ async function appRequest(path, options = {}) {
 function toolDefinition(tool, provider) {
   if (provider === "xai") {
     if (tool.type === "web_search") return { type: "web_search" };
-    if (tool.type === "file_search" || tool.type === "mcp") return null;
+    // mcp xAI принимает (проверено живой сессией 24.08.2026); file_search — нет.
+    if (tool.type === "file_search") return null;
   }
   if (provider === "openai" && (tool.type === "web_search" || tool.type === "file_search")) return null;
   if (tool.type === "dtmf") return { type: "function", name: "ascn_press_digit", description: "Набрать цифры в тональном меню (IVR). Допустимы 0-9, * и #. Используй, чтобы пройти автоответчик и дойти до живого сотрудника.", parameters: { type: "object", properties: { digits: { type: "string", description: "Цифры подряд, например 2 или 1#" } }, required: ["digits"], additionalProperties: false } };
@@ -63,15 +65,19 @@ function sessionPayload(runtime, rate) {
   const agent = runtime.agent;
   const provider = runtime.ai.provider;
   if (provider === "xai") {
+    const tempo = Number(agent.speed) || 1;
+    const tempoLine = tempo > 1.05 ? "\n\nГовори заметно бодрее и быстрее обычного, без пауз между фразами."
+      : tempo < 0.95 ? "\n\nГовори медленнее обычного, спокойно и размеренно, с паузами."
+      : "";
     return {
       type: "session.update",
       session: {
-        instructions: agent.instructions,
+        instructions: agent.instructions + tempoLine,
         modalities: agent.synthesisEnabled ? ["audio"] : ["text"],
         voice: agent.voice,
         input_audio_format: "pcm16",
         output_audio_format: "pcm16",
-        input_audio_transcription: { model: "whisper-1" },
+        input_audio_transcription: { model: "whisper-1", ...(agent.recognitionLanguage && agent.recognitionLanguage !== "auto" ? { language: agent.recognitionLanguage.split("-")[0] } : {}) },
         ...(agent.vadEnabled ? { turn_detection: { type: "server_vad", threshold: agent.vadThreshold, silence_duration_ms: agent.silenceDurationMs } } : {}),
         tools: agent.tools.map((tool) => toolDefinition(tool, provider)).filter(Boolean),
         tool_choice: "auto",
@@ -82,7 +88,7 @@ function sessionPayload(runtime, rate) {
   const input = {
     format: { type: "audio/pcm", rate: upstreamRate },
     ...(provider === "yandex" && agent.recognitionLanguage !== "auto" ? { languages: [agent.recognitionLanguage] } : {}),
-    ...(provider === "openai" ? { transcription: { model: "gpt-live-transcribe" } } : {}),
+    ...(provider === "openai" ? { transcription: { model: "gpt-live-transcribe", ...(agent.recognitionLanguage && agent.recognitionLanguage !== "auto" ? { language: agent.recognitionLanguage.split("-")[0] } : {}) } } : {}),
     ...(agent.vadEnabled ? { turn_detection: { type: "server_vad", threshold: agent.vadThreshold, silence_duration_ms: agent.silenceDurationMs } } : {}),
   };
   const tools = agent.tools.map((tool) => toolDefinition(tool, provider)).filter(Boolean);
@@ -96,7 +102,7 @@ function sessionPayload(runtime, rate) {
         output_modalities: agent.synthesisEnabled ? ["audio"] : ["text"],
         audio: {
           input,
-          output: { format: { type: "audio/pcm" }, voice: agent.voice },
+          output: { format: { type: "audio/pcm" }, voice: agent.voice, speed: Math.min(1.5, Math.max(0.25, Number(agent.speed) || 1)) },
         },
         tools,
       },
@@ -116,24 +122,24 @@ function sessionPayload(runtime, rate) {
   };
 }
 
-async function postTranscript(phone, direction, text) {
+async function postTranscript(phone, direction, text, tenantId = "") {
   if (!text?.trim()) return;
-  await appRequest("/api/voice/runtime", { method: "POST", body: JSON.stringify({ action: "transcript", phone, direction, text }) }).catch((error) => log("transcript save failed", error.message));
+  await appRequest("/api/voice/runtime", { method: "POST", body: JSON.stringify({ action: "transcript", phone, direction, text, tenantId }) }).catch((error) => log("transcript save failed", error.message));
 }
 
-function postCallMetric(callId, metric) {
+function postCallMetric(callId, metric, tenantId = "") {
   if (!callId) return;
-  appRequest("/api/voice/runtime", { method: "POST", body: JSON.stringify({ action: "call_metric", callId, ...metric }) }).catch((problem) => log("call metric failed", problem.message));
+  appRequest("/api/voice/runtime", { method: "POST", body: JSON.stringify({ action: "call_metric", callId, tenantId, ...metric }) }).catch((problem) => log("call metric failed", problem.message));
 }
 
-async function postCallStatus(callId, status, error = "") {
+async function postCallStatus(callId, status, error = "", tenantId = "") {
   if (!callId) return;
-  await appRequest("/api/voice/runtime", { method: "POST", body: JSON.stringify({ action: "call_status", callId, status, error }) }).catch((problem) => log("call status failed", problem.message));
+  await appRequest("/api/voice/runtime", { method: "POST", body: JSON.stringify({ action: "call_status", callId, status, error, tenantId }) }).catch((problem) => log("call status failed", problem.message));
 }
 
 async function registerCallRecord(meta, direction) {
   if (meta.callId) return meta.callId;
-  const body = await appRequest("/api/voice/runtime", { method: "POST", body: JSON.stringify({ action: "call_started", direction, phone: meta.phone, agentId: meta.agentId || "" }) }).catch((problem) => { log("call record failed", problem.message); return null; });
+  const body = await appRequest("/api/voice/runtime", { method: "POST", body: JSON.stringify({ action: "call_started", direction, phone: meta.phone, agentId: meta.agentId || "", tenantId: meta.tenantId || "", did: meta.did || "" }) }).catch((problem) => { log("call record failed", problem.message); return null; });
   meta.callId = body?.call?.id || "";
   return meta.callId;
 }
@@ -216,11 +222,11 @@ async function executeTool(runtime, phone, callMeta, toolName, args) {
     if (!response.ok) throw new Error(`Webhook returned ${response.status}`);
     try { return JSON.parse(text); } catch { return { result: text.slice(0, 10000) }; }
   }
-  return appRequest("/api/voice/runtime", { method: "POST", body: JSON.stringify({ action: "tool", phone, name: toolName, arguments: args, agentId: runtime.agent.id }) });
+  return appRequest("/api/voice/runtime", { method: "POST", body: JSON.stringify({ action: "tool", tenantId: runtime.tenantId || "", phone, name: toolName, arguments: args, agentId: runtime.agent.id }) });
 }
 
-async function createRealtimeSession({ agentId, phone, did, rate, callMeta, variables, onEvent, onAudio, onClose }) {
-  const runtime = await appRequest("/api/voice/runtime", { method: "POST", body: JSON.stringify({ action: "session", phone, did: did || "", agentId: agentId || "", variables: variables || {} }) });
+async function createRealtimeSession({ agentId, tenantId, phone, did, rate, callMeta, variables, onEvent, onAudio, onClose }) {
+  const runtime = await appRequest("/api/voice/runtime", { method: "POST", body: JSON.stringify({ action: "session", phone, did: did || "", agentId: agentId || "", tenantId: tenantId || "", variables: variables || {} }) });
   const isOpenAi = runtime.ai.provider === "openai";
   const isXai = runtime.ai.provider === "xai";
   const upstreamRate = isOpenAi || isXai ? 24000 : rate;
@@ -269,7 +275,7 @@ async function createRealtimeSession({ agentId, phone, did, rate, callMeta, vari
           if (savedTranscripts.size > 500) savedTranscripts.clear();
           savedTranscripts.add(transcriptKey);
         }
-        await postTranscript(phone, "inbound", event.transcript || "");
+        await postTranscript(phone, "inbound", event.transcript || "", runtime.tenantId || "");
       } else log("повторная расшифровка отброшена", transcriptKey);
     }
     if (event.type === "response.created") activeResponseId = event.response?.id || "";
@@ -279,7 +285,7 @@ async function createRealtimeSession({ agentId, phone, did, rate, callMeta, vari
     }
     if (event.type === "response.output_text.delta" || event.type === "response.output_audio_transcript.delta" || event.type === "response.text.delta" || event.type === "response.audio_transcript.delta") assistantText += event.delta || "";
     if (event.type === "response.done" && assistantText) {
-      await postTranscript(phone, "outbound", assistantText);
+      await postTranscript(phone, "outbound", assistantText, runtime.tenantId || "");
       assistantText = "";
     }
     if (event.type === "response.done") {
@@ -292,7 +298,7 @@ async function createRealtimeSession({ agentId, phone, did, rate, callMeta, vari
       try {
         const args = JSON.parse(event.item.arguments || "{}");
         output = await executeTool(runtime, phone, callMeta, event.item.name, args);
-        postCallMetric(callMeta?.callId, { tool: event.item.name });
+        postCallMetric(callMeta?.callId, { tool: event.item.name }, runtime.tenantId || "");
       } catch (error) {
         output = { error: error instanceof Error ? error.message : "Tool failed" };
       }
@@ -332,6 +338,7 @@ async function startOutboundCall(body) {
     channel: "",
     callId,
     agentId: String(body.agentId || ""),
+    tenantId: String(body.tenantId || ""),
     variables: body.variables && typeof body.variables === "object" ? body.variables : {},
     maxCallSeconds: Number(body.maxCallSeconds) || 0,
     direction: "outbound",
@@ -392,7 +399,8 @@ httpServer.on("upgrade", (request, socket, head) => {
 browserServer.on("connection", async (client, request) => {
   const url = new URL(request.url || "/", "http://localhost");
   const agentId = url.searchParams.get("agentId") || "";
-  if (!validBrowserToken(url.searchParams.get("token"), agentId)) {
+  const tokenTenant = validBrowserToken(url.searchParams.get("token"), agentId);
+  if (!tokenTenant) {
     client.close(1008, "Unauthorized");
     return;
   }
@@ -415,6 +423,7 @@ browserServer.on("connection", async (client, request) => {
   try {
     session = await createRealtimeSession({
       agentId,
+      tenantId: tokenTenant,
       phone,
       rate: 24000,
       onEvent: (event) => client.readyState === WebSocket.OPEN && client.send(JSON.stringify({ type: "event", event })),
@@ -468,7 +477,7 @@ const audioSocketServer = net.createServer((socket) => {
   function writeAudio(audio) {
     if (!firstAudioReported && audio.length && audioStartedAt) {
       firstAudioReported = true;
-      postCallMetric(meta?.callId, { firstAudioMs: Date.now() - audioStartedAt });
+      postCallMetric(meta?.callId, { firstAudioMs: Date.now() - audioStartedAt }, meta?.tenantId || "");
     }
     outgoing = Buffer.concat([outgoing, applyGain(audio, gain)]);
   }
@@ -510,6 +519,7 @@ const audioSocketServer = net.createServer((socket) => {
         try {
           session = await createRealtimeSession({
             agentId: meta.agentId,
+            tenantId: meta.tenantId || "",
             phone: meta.phone,
             did: meta.did,
             rate: 8000,
@@ -522,16 +532,21 @@ const audioSocketServer = net.createServer((socket) => {
           liveCalls.set(callId, session);
           const agent = session.runtime.agent;
           allowInterruptions = agent.allowInterruptions !== false;
-          recorder = startRecording(process.env.RECORDINGS_DIR, meta.callId || callId);
           gain = Math.min(4, Math.max(1, Number(agent.outputGain) || 1));
           startOutput(agent.ambientSound, Math.min(1, Math.max(0, Number(agent.ambientVolume) || 0)));
           const limit = Number(meta.maxCallSeconds) || Number(agent.maxCallSeconds) || 0;
           if (limit > 0) durationTimer = setTimeout(() => { log("call duration limit reached", callId); socket.end(); }, limit * 1000);
-          if (meta.callId) await postCallStatus(meta.callId, "live");
+          meta.tenantId = meta.tenantId || session.runtime.tenantId || "";
+          if (meta.callId) await postCallStatus(meta.callId, "live", "", meta.tenantId);
           else await registerCallRecord(meta, meta.direction === "outbound" ? "outbound" : "inbound");
+          // Запись включается только когда известен id карточки звонка:
+          // файл ищется по нему, и у входящих он появляется лишь здесь.
+          recorder = startRecording(process.env.RECORDINGS_DIR, meta.callId || "");
+          if (recorder) log("recording started", recorder.path);
+          else log("recording skipped", meta.callId ? "нет каталога записей" : "нет id звонка");
         } catch (error) {
           log("call setup failed", error.message);
-          if (meta.callId) await postCallStatus(meta.callId, "failed", error.message);
+          if (meta.callId) await postCallStatus(meta.callId, "failed", error.message, meta?.tenantId || "");
           socket.end();
         }
       } else if (type === 0x10 && session?.upstream.readyState === WebSocket.OPEN) {
@@ -547,11 +562,11 @@ const audioSocketServer = net.createServer((socket) => {
       const finishing = recorder;
       recorder = null;
       finishing.close()
-        .then((seconds) => { if (seconds && meta?.callId) postCallMetric(meta.callId, { recordedSeconds: seconds }); })
+        .then((seconds) => { if (seconds && meta?.callId) postCallMetric(meta.callId, { recordedSeconds: seconds }, meta?.tenantId || ""); })
         .catch((problem) => log("recording close failed", problem.message));
     }
     session?.upstream.close();
-    if (meta?.callId) postCallStatus(meta.callId, "ended");
+    if (meta?.callId) postCallStatus(meta.callId, "ended", "", meta?.tenantId || "");
     pendingCalls.delete(callId);
     liveCalls.delete(callId);
   });

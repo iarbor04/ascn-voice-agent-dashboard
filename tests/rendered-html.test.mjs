@@ -34,9 +34,17 @@ test("renders the standalone voice dashboard without messaging products", async 
 });
 
 test("protects the dashboard", async () => {
-  const response = await fetch(baseUrl);
-  assert.equal(response.status, 401);
-  assert.match(response.headers.get("www-authenticate") || "", /ASCN Voice/);
+  // Человека без входа ведём на страницу входа, а не в браузерное окно Basic.
+  const page = await fetch(baseUrl, { redirect: "manual" });
+  assert.ok([302, 307].includes(page.status), `ожидали редирект, получили ${page.status}`);
+  assert.match(page.headers.get("location") || "", /\/login/);
+  // API без входа отвечает 401 как раньше.
+  const api = await fetch(`${baseUrl}/api/voice/agents`);
+  assert.equal(api.status, 401);
+  // Явный Basic-клиент вроде curl получает прежний вызов пароля.
+  const basic = await fetch(baseUrl, { headers: { authorization: "Basic bm9wZTpub3Bl" } });
+  assert.equal(basic.status, 401);
+  assert.match(basic.headers.get("www-authenticate") || "", /ASCN Voice/);
 });
 
 test("cancels the active response when the caller interrupts", async () => {
@@ -455,12 +463,14 @@ test("прямой SIP описывается в Asterisk без регистр�
   process.env.DATA_DIR = dataDirectoryForSip;
   try {
     const { saveVoiceSettings } = await import(`../lib/voice-agents.ts?sip=${encodeURIComponent(dataDirectoryForSip)}`);
-    await saveVoiceSettings({
+    // Без query: контекст должен быть тем же экземпляром, что видит хранилище.
+    const { withTenant } = await import("../lib/tenant-context.ts");
+    await withTenant("default", () => saveVoiceSettings({
       phoneConnections: [
         { id: "direct-1", name: "СИПНЕТ прямой", number: "74951234567", mode: "direct", transport: "udp", registrar: "sipnet.ru", allowedAddresses: ["212.53.40.0/24", "sipnet.ru", "не адрес", "999.999.999.999", "10.0.0.1/64", "1.2.3.4/24/8"] },
         { id: "reg-1", name: "СИПНЕТ регистрация", number: "74951234568", mode: "register", registrar: "sipnet.ru", username: "0000000000", password: "secret", transport: "udp" },
       ],
-    });
+    }));
     const config = await readFile(join(dataDirectoryForSip, "asterisk", "pjsip-provider.conf"), "utf8");
 
     assert.match(config, /match=212\.53\.40\.0\/24/, "подсеть попала в конфиг");
@@ -553,5 +563,68 @@ test("пишет разговор в стерео: слева абонент, с
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("каждый пользователь видит только своих агентов, входящий находит владельца по номеру", async () => {
+  const json = { "content-type": "application/json" };
+  const cookieOf = (response) => (response.headers.get("set-cookie") || "").split(";")[0];
+
+  // Два независимых аккаунта
+  const registerA = await fetch(`${baseUrl}/api/auth/register`, { method: "POST", headers: json, body: JSON.stringify({ email: "a@test.ru", password: "password-a" }) });
+  assert.equal(registerA.status, 201);
+  const cookieA = cookieOf(registerA);
+  assert.match(cookieA, /ascn_session=[0-9a-f]{64}/, "регистрация сразу выдаёт сессию");
+
+  const registerB = await fetch(`${baseUrl}/api/auth/register`, { method: "POST", headers: json, body: JSON.stringify({ email: "b@test.ru", password: "password-b" }) });
+  const cookieB = cookieOf(registerB);
+
+  const duplicate = await fetch(`${baseUrl}/api/auth/register`, { method: "POST", headers: json, body: JSON.stringify({ email: "a@test.ru", password: "password-x" }) });
+  assert.equal(duplicate.status, 400, "повторная почта не проходит");
+
+  const wrong = await fetch(`${baseUrl}/api/auth/login`, { method: "POST", headers: json, body: JSON.stringify({ email: "a@test.ru", password: "wrong-pass" }) });
+  assert.equal(wrong.status, 401);
+
+  // A подключает ключ, агента и номер
+  await fetch(`${baseUrl}/api/voice/settings`, { method: "PUT", headers: { ...json, cookie: cookieA }, body: JSON.stringify({ xaiApiKey: "test-key-a", phoneConnections: [{ id: "a-phone", name: "Номер A", number: "74959998877", mode: "register", registrar: "sipnet.ru", username: "111", password: "222", transport: "udp", enabled: true }] }) });
+  const created = await fetch(`${baseUrl}/api/voice/agents`, { method: "POST", headers: { ...json, cookie: cookieA }, body: JSON.stringify({ name: "Агент арендатора A", instructions: "МАРКЕР-ТЕНАНТА-A. Ты агент.", provider: "xai", model: "grok-voice-think-fast-2.0", variables: [], tools: [], active: true }) });
+  assert.equal(created.status, 201);
+
+  // B и админ установки не видят агента A
+  const listB = await (await fetch(`${baseUrl}/api/voice/agents`, { headers: { cookie: cookieB } })).json();
+  assert.equal(listB.agents.length, 0, "у B пусто — данные не перетекают");
+  const listAdmin = await (await fetch(`${baseUrl}/api/voice/agents`, { headers: { authorization } })).json();
+  assert.ok(!listAdmin.agents.some((agent) => agent.name === "Агент арендатора A"), "админ установки живёт в своём тенанте");
+  const settingsB = await (await fetch(`${baseUrl}/api/voice/settings`, { headers: { cookie: cookieB } })).json();
+  assert.equal((settingsB.phoneConnections || []).length, 0, "номера тоже изолированы");
+
+  // Совсем без входа API закрыт
+  const anonymous = await fetch(`${baseUrl}/api/voice/agents`);
+  assert.equal(anonymous.status, 401);
+
+  // Входящий звонок: шлюз знает только набранный номер — приложение находит тенанта
+  const session = await fetch(`${baseUrl}/api/voice/runtime`, {
+    method: "POST",
+    headers: { authorization: "Bearer test-internal-key", ...json },
+    body: JSON.stringify({ action: "session", phone: "+79991234567", did: "74959998877" }),
+  });
+  assert.equal(session.status, 200, "сессия по DID собирается");
+  const built = await session.json();
+  assert.match(built.agent.instructions, /МАРКЕР-ТЕНАНТА-A/, "входящий на номер A получает агента A");
+  assert.ok(built.tenantId && built.tenantId !== "default", "тенант в ответе — не default");
+
+  // Выход гасит сессию
+  const logout = await fetch(`${baseUrl}/api/auth/logout`, { method: "POST", headers: { cookie: cookieA } });
+  assert.equal(logout.status, 200);
+  const afterLogout = await fetch(`${baseUrl}/api/voice/agents`, { headers: { cookie: cookieA } });
+  assert.equal(afterLogout.status, 401, "старая кука больше не работает");
+});
+
+test("запись начинается после регистрации звонка — файл называется по id карточки", async () => {
+  const gateway = await readFile(new URL("../voice-gateway/server.mjs", import.meta.url), "utf8");
+  const register = gateway.indexOf("else await registerCallRecord(meta,");
+  const record = gateway.indexOf("recorder = startRecording(");
+  assert.ok(register > 0 && record > 0);
+  assert.ok(record > register, "у входящего id карточки появляется только после registerCallRecord — раньше запись писалась под чужим именем и плеер её не находил");
+  assert.match(gateway, /startRecording\(process\.env\.RECORDINGS_DIR, meta\.callId \|\| ""\)/, "имя файла — строго id карточки звонка");
 });
 

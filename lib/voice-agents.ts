@@ -1,5 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { readdir } from "node:fs/promises";
+import { currentTenantId, DEFAULT_TENANT } from "./tenant-context.ts";
 
 export const realtimeModelCatalog = [
   { id: "speech-realtime-260528", provider: "yandex", label: "Speech Realtime 260528", note: "Основная модель Yandex" },
@@ -134,11 +136,22 @@ export type SafeVoiceTool = Omit<Extract<VoiceTool, { type: "mcp" }>, "authoriza
 
 export type SafeVoiceAgent = Omit<VoiceAgent, "tools"> & { tools: SafeVoiceTool[]; live: boolean; unpublished: boolean };
 
-const dataDirectory = process.env.DATA_DIR?.trim() || path.join(process.cwd(), ".data");
-const voicePath = path.join(dataDirectory, "voice-agents.json");
-const asteriskDirectory = path.join(dataDirectory, "asterisk");
+const rootDirectory = process.env.DATA_DIR?.trim() || path.join(process.cwd(), ".data");
+// Тенант default живёт по прежним путям: работающая установка ничего не мигрирует.
+// Остальные тенанты — по каталогу на пользователя.
+function tenantDirectory(tenantId: string) {
+  if (tenantId === DEFAULT_TENANT) return rootDirectory;
+  if (!/^[0-9a-f-]{36}$/i.test(tenantId)) throw new Error("Некорректный идентификатор тенанта");
+  return path.join(rootDirectory, "tenants", tenantId);
+}
+function voicePathFor(tenantId: string) { return path.join(tenantDirectory(tenantId), "voice-agents.json"); }
+// Конфиг Asterisk общий на все тенанты: телефония одна.
+const asteriskDirectory = path.join(rootDirectory, "asterisk");
 const asteriskProviderPath = path.join(asteriskDirectory, "pjsip-provider.conf");
-let queue = Promise.resolve();
+
+// Очередь изменений — своя на тенанта, иначе записи разных людей толкались бы.
+const queues = new Map<string, Promise<unknown>>();
+function queueFor(tenantId: string) { return queues.get(tenantId) || Promise.resolve(); }
 
 const defaultSettings: VoiceConnectionSettings = {
   yandexFolderId: "",
@@ -414,9 +427,9 @@ function migrateAgent(value: Partial<VoiceAgent>): VoiceAgent {
   } as VoiceAgent;
 }
 
-async function readStore(): Promise<VoiceStore> {
+async function readStore(tenantId = currentTenantId()): Promise<VoiceStore> {
   try {
-    const parsed = JSON.parse(await readFile(voicePath, "utf8")) as Partial<VoiceStore>;
+    const parsed = JSON.parse(await readFile(voicePathFor(tenantId), "utf8")) as Partial<VoiceStore>;
     const agents = (Array.isArray(parsed.agents) ? parsed.agents : []).map(migrateAgent);
     return { agents, settings: migrateSettings(parsed.settings) };
   } catch (error) {
@@ -426,20 +439,23 @@ async function readStore(): Promise<VoiceStore> {
 }
 
 async function writeStore(store: VoiceStore) {
-  await mkdir(dataDirectory, { recursive: true });
-  const temporaryPath = `${voicePath}.tmp`;
+  const tenantId = currentTenantId();
+  await mkdir(tenantDirectory(tenantId), { recursive: true });
+  const target = voicePathFor(tenantId);
+  const temporaryPath = `${target}.tmp`;
   await writeFile(temporaryPath, JSON.stringify(store, null, 2), { encoding: "utf8", mode: 0o600 });
-  await rename(temporaryPath, voicePath);
+  await rename(temporaryPath, target);
 }
 
 function mutate<T>(operation: (store: VoiceStore) => T | Promise<T>) {
-  const run = queue.catch(() => undefined).then(async () => {
-    const store = await readStore();
+  const tenantId = currentTenantId();
+  const run = queueFor(tenantId).catch(() => undefined).then(async () => {
+    const store = await readStore(tenantId);
     const result = await operation(store);
     await writeStore(store);
     return result;
   });
-  queue = run.then(() => undefined, () => undefined);
+  queues.set(tenantId, run.then(() => undefined, () => undefined));
   return run;
 }
 
@@ -461,12 +477,12 @@ export function toSafeAgent(agent: VoiceAgent): SafeVoiceAgent {
 }
 
 export async function listVoiceAgents() {
-  await queue;
+  await queueFor(currentTenantId());
   return (await readStore()).agents.map(toSafeAgent);
 }
 
 export async function getVoiceAgent(id?: string) {
-  await queue;
+  await queueFor(currentTenantId());
   const agents = (await readStore()).agents;
   return (id ? agents.find((agent) => agent.id === id) : agents.find((agent) => agent.active)) || null;
 }
@@ -495,21 +511,22 @@ export function deleteVoiceAgent(id: string) {
 export function getVoiceSettings(safe: false): Promise<VoiceConnectionSettings>;
 export function getVoiceSettings(safe?: true): Promise<SafeVoiceSettings>;
 export async function getVoiceSettings(safe = true) {
-  await queue;
+  await queueFor(currentTenantId());
   const settings = (await readStore()).settings;
   if (!safe) return settings;
   return getVoiceSettingsFromValue(settings);
 }
 
-function endpointId(connection: PhoneConnection) {
-  return `ascn-${connection.id.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 48)}`;
+function endpointId(connection: PhoneConnection, tenantId = currentTenantId()) {
+  const base = `ascn-${connection.id.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 48)}`;
+  return tenantId === DEFAULT_TENANT ? base : `t${tenantId.replace(/[^a-z0-9]/gi, "").slice(0, 8)}-${base}`;
 }
 
-function renderAsteriskProviders(settings: VoiceConnectionSettings) {
+function renderAsteriskProviders(settings: VoiceConnectionSettings, tenantId = currentTenantId()) {
   const ready = settings.phoneConnections.filter((item) => item.enabled && (item.mode === "direct" ? item.allowedAddresses.length > 0 : item.registrar && item.username && item.password));
   if (!ready.length) return "; SIP-транки не настроены в ASCN\n";
   return ready.map((connection) => {
-    const section = endpointId(connection);
+    const section = endpointId(connection, tenantId);
     const transport = connection.transport === "tcp" ? "transport-tcp" : "transport-udp";
     const proxy = connection.proxy ? `outbound_proxy=sip:${connection.proxy}\\;lr\n` : "";
     const match = connection.registrar.replace(/^sips?:\/\//i, "").split(":")[0];
@@ -523,12 +540,49 @@ function renderAsteriskProviders(settings: VoiceConnectionSettings) {
   }).join("\n");
 }
 
+export async function listTenantIds() {
+  const ids = [DEFAULT_TENANT];
+  try {
+    for (const entry of await readdir(path.join(rootDirectory, "tenants"))) {
+      if (/^[0-9a-f-]{36}$/i.test(entry)) ids.push(entry);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return ids;
+}
+
+// Телефония одна на всех: конфиг Asterisk собирается из транков каждого тенанта.
+// Настройки текущего тенанта приходят из памяти: на диске они ещё старые,
+// запись случится после этого рендера.
+async function renderAsteriskAll(current: { tenantId: string; settings: VoiceConnectionSettings }) {
+  const parts: string[] = [];
+  for (const tenantId of await listTenantIds()) {
+    const settings = tenantId === current.tenantId
+      ? current.settings
+      : (await readStore(tenantId).catch(() => null))?.settings;
+    if (settings?.phoneConnections.length) parts.push(renderAsteriskProviders(settings, tenantId));
+  }
+  return parts.join("\n") || "; SIP-транки не настроены в ASCN\n";
+}
+
+// Входящий приходит без тенанта — находим владельца номера по DID.
+export async function findTenantByDid(did: string) {
+  const wanted = normalizeDialedNumber(did || "");
+  if (!wanted) return null;
+  for (const tenantId of await listTenantIds()) {
+    const store = await readStore(tenantId).catch(() => null);
+    if (store?.settings.phoneConnections.some((item) => item.enabled && normalizeDialedNumber(item.number) === wanted)) return tenantId;
+  }
+  return null;
+}
+
 export function saveVoiceSettings(value: unknown) {
   return mutate(async (store) => {
     store.settings = normalizeSettings(value, store.settings);
     await mkdir(asteriskDirectory, { recursive: true });
     const temporaryPath = `${asteriskProviderPath}.tmp`;
-    await writeFile(temporaryPath, renderAsteriskProviders(store.settings), { encoding: "utf8", mode: 0o600 });
+    await writeFile(temporaryPath, await renderAsteriskAll({ tenantId: currentTenantId(), settings: store.settings }), { encoding: "utf8", mode: 0o600 });
     await rename(temporaryPath, asteriskProviderPath);
     return getVoiceSettingsFromValue(store.settings);
   });
@@ -593,7 +647,7 @@ export function unpublishVoiceAgent(id: string) {
 }
 
 export async function resolveVoiceRoute(did?: string, requestedAgentId?: string) {
-  await queue;
+  await queueFor(currentTenantId());
   const store = await readStore();
   const normalizedDid = normalizeDialedNumber(did || "");
   const connection = normalizedDid ? store.settings.phoneConnections.find((item) => item.enabled && normalizeDialedNumber(item.number) === normalizedDid) : undefined;
@@ -626,7 +680,7 @@ export function normalizeDialTarget(value: string) {
 }
 
 export async function resolveOutboundRoute(agentId?: string, connectionId?: string) {
-  await queue;
+  await queueFor(currentTenantId());
   const store = await readStore();
   const found = (agentId ? store.agents.find((item) => item.id === agentId) : store.agents.find((item) => item.active)) || null;
   const agent = found ? liveAgent(found) : null;

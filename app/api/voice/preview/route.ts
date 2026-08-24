@@ -1,3 +1,4 @@
+import { tenantRoute } from "@/lib/guard";
 import WebSocket from "ws";
 import { previewSession, realtimeEndpoint, wavFromPcm16 } from "@/lib/realtime-endpoint";
 import { getVoiceSettings, providerLabels, type AiProvider } from "@/lib/voice-agents";
@@ -31,7 +32,7 @@ function speak(url: string, headers: Record<string, string>, session: object) {
   });
 }
 
-export async function POST(request: Request) {
+async function handlePOST(request: Request) {
   const body = await request.json().catch(() => null) as { provider?: string; voice?: string; model?: string; phrase?: string } | null;
   const providers = Object.keys(providerLabels) as AiProvider[];
   const provider = providers.find((item) => item === body?.provider);
@@ -46,3 +47,5 @@ export async function POST(request: Request) {
     headers: { "content-type": "audio/wav", "cache-control": "no-store" },
   });
 }
+
+export const POST = tenantRoute(handlePOST);

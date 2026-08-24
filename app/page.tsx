@@ -29,12 +29,26 @@ const statusLabels: Record<string, string> = { queued: "В очереди", dial
 
 export default function Home() {
   const [view, setView] = useState<View>("agents");
+  const [account, setAccount] = useState<{ email: string; kind: string } | null>(null);
+  useEffect(() => {
+    let alive = true;
+    fetch("/api/auth/me", { cache: "no-store" })
+      .then((response) => response.status === 401 ? (window.location.href = "/login", null) : response.json())
+      .then((result) => { if (alive && result?.email) setAccount(result); })
+      .catch(() => undefined);
+    return () => { alive = false; };
+  }, []);
+  async function logout() {
+    await fetch("/api/auth/logout", { method: "POST" });
+    window.location.href = "/login";
+  }
   const [toast, setToast] = useState("");
   const notify = useCallback((message: string) => { setToast(message); window.setTimeout(() => setToast(""), 2600); }, []);
   return <main className="app-shell">
     <aside className="sidebar">
       <div className="brand"><Image className="brand-emblem" src="/emblem.svg" width={36} height={36} alt="ASCN.AI" priority /><span>ASCN.AI Voice</span></div>
       <nav className="main-nav"><p>ГОЛОСОВАЯ ПЛАТФОРМА</p><button className={view === "agents" ? "active" : ""} onClick={() => setView("agents")}><Bot className="nav-icon" />Голосовые агенты</button><button className={view === "calls" ? "active" : ""} onClick={() => setView("calls")}><PhoneCall className="nav-icon" />Звонки</button><button className={view === "insights" ? "active" : ""} onClick={() => setView("insights")}><BarChart3 className="nav-icon" />Аналитика</button></nav>
+      {account && <div className="sidebar-account"><b title={account.email}>{account.email}</b>{account.kind === "session" && <button onClick={() => void logout()}>Выйти</button>}</div>}
     </aside>
     <section className="workspace"><header className="topbar"><div className="breadcrumbs"><span>Голосовой проект</span><i>/</i><strong>{view === "agents" ? "Голосовые агенты" : view === "calls" ? "Звонки" : "Аналитика"}</strong></div></header><div className="content">{view === "agents" ? <VoiceAgents notify={notify} /> : view === "calls" ? <Calls notify={notify} /> : <InsightsView />}</div></section>
     {toast && <div className="toast"><span>✓</span>{toast}</div>}

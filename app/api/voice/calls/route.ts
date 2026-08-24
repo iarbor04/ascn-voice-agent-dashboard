@@ -1,11 +1,13 @@
+import { tenantRoute } from "@/lib/guard";
+import { currentTenantId } from "@/lib/tenant-context";
 import { createCallRecord, listCallRecords, updateCallRecord } from "@/lib/calls";
 import { canonicalPhone, formatDialNumber, getAsteriskEndpoint, normalizeCallVariables, normalizeDialTarget, providerTransport, resolveOutboundRoute } from "@/lib/voice-agents";
 
-export async function GET() {
+async function handleGET() {
   return Response.json({ calls: await listCallRecords() });
 }
 
-export async function POST(request: Request) {
+async function handlePOST(request: Request) {
   const body = await request.json().catch(() => null) as Record<string, unknown> | null;
   const toNumber = normalizeDialTarget(typeof body?.toNumber === "string" ? body.toNumber : "");
   if (!toNumber) return Response.json({ error: "Укажите корректный номер в формате +7XXXXXXXXXX" }, { status: 400 });
@@ -26,7 +28,7 @@ export async function POST(request: Request) {
     const response = await fetch(`${gatewayUrl.replace(/\/$/, "")}/calls`, {
       method: "POST",
       headers: { authorization: `Bearer ${process.env.INTERNAL_API_KEY?.trim() || ""}`, "content-type": "application/json" },
-      body: JSON.stringify({ callId: call.id, agentId: agent.id, toNumber: formatDialNumber(toNumber, connection.dialFormat) || toNumber, fromNumber: connection.number || connection.username, endpoint: getAsteriskEndpoint(connection), variables, maxCallSeconds: agent.maxCallSeconds }),
+      body: JSON.stringify({ callId: call.id, tenantId: currentTenantId(), agentId: agent.id, toNumber: formatDialNumber(toNumber, connection.dialFormat) || toNumber, fromNumber: connection.number || connection.username, endpoint: getAsteriskEndpoint(connection), variables, maxCallSeconds: agent.maxCallSeconds }),
       signal: AbortSignal.timeout(15000),
     });
     const result = await response.json().catch(() => ({})) as { error?: string };
@@ -37,3 +39,6 @@ export async function POST(request: Request) {
     return Response.json({ call: await updateCallRecord(call.id, { status: "failed", error: message }), error: message }, { status: 502 });
   }
 }
+
+export const GET = tenantRoute(handleGET);
+export const POST = tenantRoute(handlePOST);

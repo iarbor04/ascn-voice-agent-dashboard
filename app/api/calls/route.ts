@@ -1,2 +1,5 @@
+import { tenantRoute } from "@/lib/guard";
 import { listContacts } from "@/lib/calls";
-export async function GET() { return Response.json({ contacts: await listContacts() }); }
+async function handleGET() { return Response.json({ contacts: await listContacts() }); }
+
+export const GET = tenantRoute(handleGET);

@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Image from "next/image";
-import { ArrowLeft, ArrowUp, AudioLines, BookOpen, Bot, Copy, Search, Briefcase, CalendarDays, CircleStop, Code2, ExternalLink, Headphones, Mail, Mic, Phone, Plus, Save, Settings2, ShieldAlert, Sparkles, Trash2, TrendingUp, Upload, UserCheck, Wrench, X, type LucideIcon } from "lucide-react";
+import { ArrowLeft, ArrowUp, AudioLines, BookOpen, Bot, Copy, Search, Briefcase, CalendarDays, CircleStop, Code2, ExternalLink, Headphones, Mic, Phone, Plus, Save, Settings2, ShieldAlert, Sparkles, Trash2, TrendingUp, Upload, UserCheck, Wrench, X, type LucideIcon } from "lucide-react";
 
 type Provider = "yandex" | "deepseek" | "openai" | "xai";
 type Transport = "yandex" | "openai" | "xai";
@@ -140,12 +140,34 @@ function AgentBuilderDialog({ seed, onCancel, onSkip, onReady, notify }: {
         {messages.map((message, index) => <p key={`${index}-${message.text.slice(0, 12)}`} className={message.role}>{message.text}</p>)}
         {busy && <p className="assistant thinking"><span /><span /><span /></p>}
       </div>
+      {!messages.some((message) => message.role === "user") && <div className="builder-starters">{starters.map((starter) => <button type="button" key={starter.label} className={`starter ${starter.tone}`} disabled={busy} onClick={() => void send(`Хочу собрать агента: ${starter.label}.`)}><i><starter.icon size={15} /></i>{starter.label}</button>)}</div>}
       <footer className="builder-input">
         <input value={text} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && text.trim() && !busy) void send(text.trim()); }} placeholder="Опишите, что должен делать агент" aria-label="Сообщение помощнику" />
         <button type="button" className="pill-button solid" disabled={busy || !text.trim()} onClick={() => void send(text.trim())} aria-label="Отправить"><ArrowUp size={16} /></button>
       </footer>
     </div>
   </div>;
+}
+
+// Каталог инструментов в духе консоли: что ещё можно добавить агенту.
+function toolCatalog(agent: Agent) {
+  const has = (type: string, name?: string) => agent.tools.some((tool) => tool.type === type && (!name || tool.name === name));
+  const entries: Array<{ key: string; label: string; note: string; icon: React.ReactNode }> = [];
+  const icons: Record<string, React.ReactNode> = {
+    contact_context: <BookOpen size={16} />, update_contact: <UserCheck size={16} />, remember_note: <Sparkles size={16} />,
+    move_pipeline: <TrendingUp size={16} />, transfer_call: <Phone size={16} />, end_call: <CircleStop size={16} />,
+    search_knowledge: <Search size={16} />,
+  };
+  for (const [name, label] of builtins) {
+    if (!has("ascn", name)) entries.push({ key: `ascn:${name}`, label, note: toolNotes[name] || "", icon: icons[name] || <Wrench size={16} /> });
+  }
+  if (!has("dtmf")) entries.push({ key: "dtmf", label: "Тональный набор (IVR)", note: toolNotes.dtmf, icon: <Phone size={16} /> });
+  // Только то, что реально исполняется: веб-поиск и MCP xAI выполняет сам
+  // (проверено живой сессией), у Яндекса исполнителя для них нет — не предлагаем.
+  if (transportOf(agent.provider) === "xai" && !has("web_search")) entries.push({ key: "web_search", label: "Поиск в интернете", note: toolNotes.web_search, icon: <Search size={16} /> });
+  // MCP и свой webhook из каталога убраны по решению владельца (24.08.2026):
+  // «убери пока подключения». Механика в шлюзе живая — вернуть можно одной строкой.
+  return entries;
 }
 
 const tabs = [
@@ -338,6 +360,46 @@ const models: Array<{ id: string; provider: Provider; label: string; note: strin
 ];
 const yandexVoices = ["filipp", "alena", "ermil", "jane", "omazh", "zahar", "dasha", "julia", "lera", "masha", "marina", "alexander", "kirill", "anton", "madi_ru", "saule_ru", "zamira_ru", "zhanar_ru", "yulduz_ru", "john", "lea", "naomi", "amira", "madi", "saule", "zhanar", "nigora", "zamira", "yulduz"];
 const openaiVoices = ["marin", "cedar", "alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"];
+const yandexVoiceNotes: Record<string, string> = {
+  filipp: "мужской", ermil: "мужской", zahar: "мужской", alexander: "мужской", kirill: "мужской", anton: "мужской", john: "мужской, английский", madi: "мужской, казахский", madi_ru: "мужской",
+  alena: "женский", jane: "женский", omazh: "женский", dasha: "женский", julia: "женский", lera: "женский", masha: "женский", marina: "женский",
+  lea: "женский, английский", naomi: "женский, английский", amira: "женский, арабский", saule: "женский, казахский", zhanar: "женский, казахский",
+  saule_ru: "женский", zamira_ru: "женский", zhanar_ru: "женский", yulduz_ru: "женский", nigora: "женский, узбекский", zamira: "женский, узбекский", yulduz: "женский, узбекский",
+};
+const openaiVoiceNotes: Record<string, string> = { marin: "женский, лучшее качество", cedar: "мужской, лучшее качество" };
+
+function voiceCatalog(provider: Provider) {
+  if (transportOf(provider) === "xai") return xaiVoices;
+  if (provider === "openai") return openaiVoices.map((id) => ({ id, note: openaiVoiceNotes[id] || "" }));
+  return yandexVoices.map((id) => ({ id, note: yandexVoiceNotes[id] || "" }));
+}
+
+// Библиотека голосов: поиск, фильтр по полу, прослушивание каждой строки.
+function VoiceLibrary({ agent, onPick, onPlay, busyVoice }: { agent: Agent; onPick: (id: string) => void; onPlay: (id: string) => void; busyVoice: string }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [gender, setGender] = useState("all");
+  const list = voiceCatalog(agent.provider).filter((voice) => {
+    if (query && !voice.id.toLowerCase().includes(query.toLowerCase())) return false;
+    if (gender === "male") return voice.note.includes("мужской");
+    if (gender === "female") return voice.note.includes("женский");
+    return true;
+  });
+  return <div className="voice-lib">
+    <button type="button" className="pill-button" aria-expanded={open} onClick={() => setOpen((current) => !current)}><AudioLines size={15} /> {agent.voice || "Выбрать голос"}</button>
+    {open && <div className="voice-lib-panel">
+      <header><strong>Библиотека голосов</strong><button type="button" className="dialog-close" aria-label="Закрыть" onClick={() => setOpen(false)}><X size={15} /></button></header>
+      <div className="voice-lib-filters">
+        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Поиск" aria-label="Поиск голоса" />
+        <select value={gender} onChange={(event) => setGender(event.target.value)} aria-label="Пол голоса"><option value="all">Все</option><option value="male">Мужские</option><option value="female">Женские</option></select>
+      </div>
+      <div className="voice-lib-list">{list.map((voice) => <div key={voice.id} className={agent.voice === voice.id ? "_active" : ""}>
+        <button type="button" className="voice-lib-pick" onClick={() => { onPick(voice.id); setOpen(false); }}><strong>{voice.id}</strong><small>{voice.note || "без пометки"}</small></button>
+        <button type="button" className="voice-lib-play" aria-label={`Прослушать ${voice.id}`} disabled={busyVoice === voice.id} onClick={() => onPlay(voice.id)}>{busyVoice === voice.id ? "…" : "▶"}</button>
+      </div>)}{!list.length && <p className="knowledge-empty">Ничего не нашлось.</p>}</div>
+    </div>}
+  </div>;
+}
 const xaiVoices = [
   "xai_rex · мужской, 128 Гц",
   "xai_sal · мужской, 133 Гц",
@@ -549,27 +611,25 @@ function ConnectionSettings({ agents, settings, setSettings, saving, onSave, onB
     const result = checks[provider];
     return <p className="provider-check"><button className="ghost-button" onClick={() => void checkProvider(provider)}>{label}</button>{result && <span className={result.ok === undefined ? "" : result.ok ? "ok" : "bad"}>{result.ok === true ? "✓ " : result.ok === false ? "✗ " : ""}{result.detail}</span>}</p>;
   }
-  const stores = [
-    { name: "SIPNET", note: "Регистрация по SIP ID, прямой номер отдельной услугой", url: "https://www.sipnet.ru/register" },
-    { name: "MANGO OFFICE", note: "Российские городские и многоканальные номера", url: "https://www.mango-office.ru/products/virtual_number/" },
-    { name: "Телфин", note: "SIP-номера России и других стран", url: "https://www.telphin.ru/products/virtual-numbers/sip-number" },
-    { name: "Novofon", note: "Номера РФ через Госуслуги, 8-800 и SIP-trunk", url: "https://novofon.com/numbers/russian-federation/" },
-  ];
-  return <div className="voice-connection"><header className="voice-editor-header"><button onClick={onBack} aria-label="Назад">←</button><div><h1>Модели и телефонные номера</h1><p>Один номер можно назначить одному агенту. Ключи и SIP-пароли остаются только на сервере.</p></div></header>
-    <div className="provider-settings-grid">
-      <section className="voice-settings-card"><div className="voice-settings-heading"><Bot /><div><h2>Yandex AI Studio</h2><p>Для Speech Realtime и DeepSeek Realtime.</p></div><a className="provider-link" href="https://aistudio.yandex.ru/docs/ru/ai-studio/operations/get-api-key.html" target="_blank" rel="noreferrer">Создать ключ <ExternalLink size={14} /></a></div><div className="voice-settings-grid"><label>Идентификатор каталога<input value={settings.yandexFolderId} onChange={(event) => patch({ yandexFolderId: event.target.value })} placeholder="b1g..." /></label><label>API-ключ<input type="password" autoComplete="off" value={settings.yandexApiKey} onChange={(event) => patch({ yandexApiKey: event.target.value })} placeholder={settings.yandexApiKeyConfigured ? "Ключ уже сохранён — оставьте пустым" : "AQVN..."} /></label></div><p className="settings-hint">Сервисному аккаунту нужна роль <code>ai.models.user</code>. Этот же ключ обслуживает DeepSeek Realtime.</p>{checkButton("yandex", "Проверить Yandex")}{checkButton("deepseek", "Проверить DeepSeek")}</section>
-      <section className="voice-settings-card"><div className="voice-settings-heading"><Bot /><div><h2>OpenAI Realtime</h2><p>Для GPT Realtime 2.1, mini, 2 и 1.5.</p></div><a className="provider-link" href="https://platform.openai.com/api-keys" target="_blank" rel="noreferrer">Создать ключ <ExternalLink size={14} /></a></div><div className="voice-settings-grid"><label>API-ключ<input type="password" autoComplete="off" value={settings.openaiApiKey} onChange={(event) => patch({ openaiApiKey: event.target.value })} placeholder={settings.openaiApiKeyConfigured ? "Ключ уже сохранён — оставьте пустым" : "sk-proj-..."} /></label><label>Project ID <small>необязательно</small><input value={settings.openaiProjectId} onChange={(event) => patch({ openaiProjectId: event.target.value })} placeholder="proj_..." /></label></div>{checkButton("openai", "Проверить OpenAI")}</section>
-      <section className="voice-settings-card"><div className="voice-settings-heading"><Bot /><div><h2>xAI Grok Voice</h2><p>Для Grok Voice Think Fast 2.0.</p></div><a className="provider-link" href="https://console.x.ai/home" target="_blank" rel="noreferrer">Создать ключ <ExternalLink size={14} /></a></div><div className="voice-settings-grid"><label>API-ключ<input type="password" autoComplete="off" value={settings.xaiApiKey} onChange={(event) => patch({ xaiApiKey: event.target.value })} placeholder={settings.xaiApiKeyConfigured ? "Ключ уже сохранён — оставьте пустым" : "xai-..."} /></label></div><p className="settings-hint">У ключа должен быть доступ к эндпоинту voice. Аудио приходит как PCM 24 кГц, в телефонию шлюз пересчитывает сам.</p>{checkButton("xai", "Проверить xAI")}</section>
+  const providerReady = Boolean(settings.yandexApiKeyConfigured || settings.openaiApiKeyConfigured || settings.xaiApiKeyConfigured);
+  const numberReady = settings.phoneConnections.length > 0;
+  const assignedReady = settings.phoneConnections.some((item) => item.agentId);
+  const statusChip = (ok: boolean | undefined) => <span className={`conn-status${ok ? " _ok" : ""}`}>{ok ? "Подключён" : "Не подключён"}</span>;
+
+  return <div className="voice-connection"><header className="voice-editor-header"><button onClick={onBack} aria-label="Назад">←</button><div><h1>Подключение и номера</h1><p>Три шага до звонка: ключ провайдера, номер, агент на номере. Секреты остаются на сервере.</p></div></header>
+    <div className="setup-progress">
+      <div className={providerReady ? "_done" : ""}><i>{providerReady ? "✓" : "1"}</i><div><strong>Ключ провайдера речи</strong><p>{providerReady ? "Есть — агенту есть чем говорить" : "Вставьте ключ ниже и нажмите «Проверить»"}</p></div></div>
+      <div className={numberReady ? "_done" : ""}><i>{numberReady ? "✓" : "2"}</i><div><strong>Телефонный номер</strong><p>{numberReady ? `Подключено: ${settings.phoneConnections.length}` : "Добавьте номер своего оператора"}</p></div></div>
+      <div className={assignedReady ? "_done" : ""}><i>{assignedReady ? "✓" : "3"}</i><div><strong>Агент на номере</strong><p>{assignedReady ? "Назначен — можно звонить" : "Выберите, кто отвечает на звонки"}</p></div></div>
     </div>
-    <section className="voice-settings-card"><div className="voice-settings-heading"><Wrench /><div><h2>Голосовой шлюз</h2><p>Единый защищённый WebSocket для теста и телефонии.</p></div></div><div className="voice-settings-grid"><label className="wide">Публичный адрес voice gateway<input value={settings.gatewayPublicUrl} onChange={(event) => patch({ gatewayPublicUrl: event.target.value })} placeholder="wss://voice.example.ru/voice-ws/session" /><small>На сервере этот адрес направляется на voice-gateway:8787.</small></label></div></section>
-    <section className="voice-settings-card"><div className="voice-settings-heading"><Mail /><div><h2>Почта для писем после звонка</h2><p>Обычный SMTP вашего домена или почтового сервиса. Без него письма из настроек агента не уйдут.</p></div></div><div className="voice-settings-grid">
-      <label>SMTP-сервер<input value={settings.smtpHost} onChange={(event) => patch({ smtpHost: event.target.value })} placeholder="smtp.yandex.ru" /></label>
-      <label>Порт<input type="number" min="1" max="65535" value={settings.smtpPort} onChange={(event) => patch({ smtpPort: Number(event.target.value) })} /><small>465 — TLS сразу, 587 — STARTTLS.</small></label>
-      <label>Логин<input value={settings.smtpUser} onChange={(event) => patch({ smtpUser: event.target.value })} placeholder="robot@example.ru" /></label>
-      <label>Пароль<input type="password" value={settings.smtpPassword} onChange={(event) => patch({ smtpPassword: event.target.value })} placeholder={settings.smtpPasswordConfigured ? "сохранён — оставьте пустым" : "пароль приложения"} /></label>
-      <label className="wide">Адрес отправителя<input value={settings.smtpFrom} onChange={(event) => patch({ smtpFrom: event.target.value })} placeholder="robot@example.ru" /><small>Многие сервисы требуют, чтобы он совпадал с логином.</small></label>
-    </div></section>
-    <section className="voice-settings-card phone-sources"><div className="voice-settings-heading"><Phone /><div><h2>Где подключить обычный номер</h2><p>Выберите +7 или номер другой страны. После покупки оператор покажет SIP server, login и password.</p></div></div><div className="phone-source-grid">{stores.map((store) => <a key={store.name} href={store.url} target="_blank" rel="noreferrer"><strong>{store.name}</strong><span>{store.note}</span><em>Открыть сайт <ExternalLink size={13} /></em></a>)}</div><p className="settings-hint">Доступность российских номеров и требования к документам определяет оператор связи.</p></section>
+    <div className="provider-settings-grid">
+      <section className="voice-settings-card"><div className="voice-settings-heading"><span className="plogo"><Image src="/logos/xai.png" alt="xAI" width={40} height={40} unoptimized /></span><div><h2>xAI Grok Voice</h2><p>Для Grok Voice Think Fast 2.0.</p></div>{statusChip(settings.xaiApiKeyConfigured)}<a className="provider-link" href="https://console.x.ai/" target="_blank" rel="noreferrer">Создать ключ <ExternalLink size={14} /></a></div><div className="voice-settings-grid"><label className="wide">API-ключ<input type="password" autoComplete="off" value={settings.xaiApiKey} onChange={(event) => patch({ xaiApiKey: event.target.value })} placeholder={settings.xaiApiKeyConfigured ? "Ключ уже сохранён — оставьте пустым" : "xai-..."} /></label></div><p className="settings-hint">У ключа должен быть доступ к эндпоинту voice.</p>{checkButton("xai", "Проверить xAI")}</section>
+      <section className="voice-settings-card"><div className="voice-settings-heading"><span className="plogo"><Image src="/logos/yandex.png" alt="Yandex" width={40} height={40} unoptimized /></span><div><h2>Yandex AI Studio</h2><p>Для Speech Realtime и DeepSeek Realtime.</p></div>{statusChip(settings.yandexApiKeyConfigured)}<a className="provider-link" href="https://aistudio.yandex.ru/docs/ru/ai-studio/operations/get-api-key.html" target="_blank" rel="noreferrer">Создать ключ <ExternalLink size={14} /></a></div><div className="voice-settings-grid"><label>Идентификатор каталога<input value={settings.yandexFolderId} onChange={(event) => patch({ yandexFolderId: event.target.value })} placeholder="b1g..." /></label><label>API-ключ<input type="password" autoComplete="off" value={settings.yandexApiKey} onChange={(event) => patch({ yandexApiKey: event.target.value })} placeholder={settings.yandexApiKeyConfigured ? "Ключ уже сохранён — оставьте пустым" : "AQVN..."} /></label></div><p className="settings-hint">Сервисному аккаунту нужна роль <code>ai.models.user</code>. Этот же ключ обслуживает DeepSeek.</p>{checkButton("yandex", "Проверить Yandex")}{checkButton("deepseek", "Проверить DeepSeek")}</section>
+      <section className="voice-settings-card"><div className="voice-settings-heading"><span className="plogo"><Image src="/logos/openai.png" alt="OpenAI" width={40} height={40} unoptimized /></span><div><h2>OpenAI Realtime</h2><p>Для GPT Realtime 2.1, mini, 2 и 1.5.</p></div>{statusChip(settings.openaiApiKeyConfigured)}<a className="provider-link" href="https://platform.openai.com/api-keys" target="_blank" rel="noreferrer">Создать ключ <ExternalLink size={14} /></a></div><div className="voice-settings-grid"><label>API-ключ<input type="password" autoComplete="off" value={settings.openaiApiKey} onChange={(event) => patch({ openaiApiKey: event.target.value })} placeholder={settings.openaiApiKeyConfigured ? "Ключ уже сохранён — оставьте пустым" : "sk-proj-..."} /></label><label>Project ID <i>необязательно</i><input value={settings.openaiProjectId} onChange={(event) => patch({ openaiProjectId: event.target.value })} placeholder="proj_..." /></label></div>{checkButton("openai", "Проверить OpenAI")}</section>
+    </div>
+    <details className="advanced-conn"><summary>Дополнительно: адрес голосового шлюза</summary>
+      <div className="voice-settings-grid"><label className="wide">Публичный адрес voice gateway<input value={settings.gatewayPublicUrl} onChange={(event) => patch({ gatewayPublicUrl: event.target.value })} placeholder="wss://voice.example.ru/voice-ws/session" /><small>На сервере этот адрес направляется на voice-gateway:8787. Нужен только для теста голосом из браузера.</small></label></div>
+    </details>
     {dialog && <NewNumberDialog agents={agents} taken={settings.phoneConnections.length} serverHost={dialog.host} onCancel={() => setDialog(null)} onCreate={(connection) => { patch({ phoneConnections: [...settings.phoneConnections, connection] }); setDialog(null); }} />}
     <section className="phone-connections-section"><div className="phone-connections-heading"><div><h2>Номера и агенты</h2><p>Для каждого номера сохраните SIP-данные и выберите, кто отвечает.</p></div><button className="ghost-button" onClick={addPhone}><Plus size={15} /> Добавить номер</button></div>
       {!settings.phoneConnections.length && <div className="phone-empty"><Phone /><p>Номера ещё не добавлены.</p><button className="primary-button" onClick={addPhone}>Добавить первый номер</button></div>}
@@ -581,7 +641,6 @@ function ConnectionSettings({ agents, settings, setSettings, saving, onSave, onB
 
 function AgentEditor({ agent, setAgent, settings, saving, onSave, onPublish, onAddNumber, onBack, notify }: { agent: Agent; onPublish: (live: boolean) => void; onAddNumber: (connection: PhoneConnection) => void; setAgent: React.Dispatch<React.SetStateAction<Agent | null>>; settings: Settings; saving: boolean; onSave: () => void; onBack: () => void; notify: (message: string) => void }) {
   const patch = (changes: Partial<Agent>) => setAgent((current) => current ? { ...current, ...changes } : current);
-  const [toolType, setToolType] = useState("ascn:contact_context");
   const [preview, setPreview] = useState<{ state: "idle" | "loading" | "error"; detail?: string }>({ state: "idle" });
   const [tab, setTab] = useState("config");
   const [tester, setTester] = useState(false);
@@ -638,14 +697,16 @@ function AgentEditor({ agent, setAgent, settings, saving, onSave, onPublish, onA
     if (added.length) patch({ knowledge: [...agent.knowledge, ...added].slice(0, 20) });
   }
   const previewRef = useRef<HTMLAudioElement | null>(null);
-  async function playVoice() {
+  const [busyVoice, setBusyVoice] = useState("");
+  async function playVoice(voiceId = agent.voice) {
     previewRef.current?.pause();
+    setBusyVoice(voiceId);
     setPreview({ state: "loading" });
     try {
       const response = await fetch("/api/voice/preview", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ provider: agent.provider, model: agent.model, voice: agent.voice, phrase: agent.firstMessage || "Здравствуйте! Чем могу помочь?" }),
+        body: JSON.stringify({ provider: agent.provider, model: agent.model, voice: voiceId, phrase: agent.firstMessage || "Здравствуйте! Чем могу помочь?" }),
       });
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
@@ -663,7 +724,6 @@ function AgentEditor({ agent, setAgent, settings, saving, onSave, onPublish, onA
     }
   }
   const providerModels = models.filter((model) => model.provider === agent.provider);
-  const availableVoices = agent.provider === "openai" ? openaiVoices : yandexVoices;
   function changeProvider(provider: Provider) {
     patch({
       provider,
@@ -671,11 +731,10 @@ function AgentEditor({ agent, setAgent, settings, saving, onSave, onPublish, onA
       voice: provider === "openai" ? "marin" : provider === "xai" ? "xai_ara" : "filipp",
       tools: provider === "openai" ? agent.tools.filter((tool) => tool.type !== "web_search" && tool.type !== "file_search") : provider === "xai" ? agent.tools.filter((tool) => tool.type !== "file_search" && tool.type !== "mcp") : agent.tools,
     });
-    setToolType("ascn:contact_context");
   }
-  function addTool() {
+  function addTool(key: string) {
     if (agent.tools.length >= 8) return notify("Можно подключить не больше восьми инструментов");
-    const [type, name] = toolType.split(":");
+    const [type, name] = key.split(":");
     if (type === "ascn" && agent.tools.some((tool) => tool.type === "ascn" && tool.name === name)) return notify("Этот инструмент уже добавлен");
     let tool: Tool;
     if (type === "ascn") tool = { id: id(), type, name };
@@ -735,15 +794,14 @@ function AgentEditor({ agent, setAgent, settings, saving, onSave, onPublish, onA
           <div className="setting-row filled"><div><strong>Собеседник может перебивать</strong><p>Включено — речь собеседника прерывает агента на полуслове.</p></div><label className="switch"><b className="sr-only">Собеседник может перебивать</b><input type="checkbox" checked={agent.allowInterruptions} onChange={(event) => patch({ allowInterruptions: event.target.checked })} /><span /></label></div>
           <div className="setting-row"><div><strong>Агент знает номер звонящего</strong><p>Включено — номер попадает в промпт, агент может его назвать.</p></div><label className="switch"><b className="sr-only">Агент знает номер звонящего</b><input type="checkbox" checked={agent.shareCallerNumber} onChange={(event) => patch({ shareCallerNumber: event.target.checked })} /><span /></label></div>
         </section>
-        <section className="tools-section"><div className="voice-section-title"><span>Инструменты <i>{agent.tools.length}/8</i></span></div><div className="tool-adder"><select aria-label="Тип инструмента" value={toolType} onChange={(event) => setToolType(event.target.value)}>{builtins.map(([value, label]) => <option key={value} value={`ascn:${value}`}>ASCN · {label}</option>)}<option value="dtmf">Тональный набор (IVR)</option>{transportOf(agent.provider) === "yandex" && <><option value="web_search">Yandex Web Search</option><option value="file_search">Yandex File Search</option></>}{transportOf(agent.provider) === "xai" && <option value="web_search">Поиск в интернете (xAI)</option>}<option value="mcp">MCP-сервер</option><option value="function">Своя функция / webhook</option></select><button onClick={addTool}><Plus size={15} /> Добавить</button></div><div className="tool-list">{agent.tools.map((tool) => <ToolRow key={tool.id} tool={tool} used={toolUsage ? (toolUsage[tool.type === "ascn" ? `ascn_${tool.name}` : tool.type === "dtmf" ? "ascn_press_digit" : String(tool.name || tool.type)] || 0) : undefined} onChange={(changes) => updateTool(tool.id, changes)} onDelete={() => patch({ tools: agent.tools.filter((item) => item.id !== tool.id) })} />)}</div></section>
+        <section className="tools-section"><div className="voice-section-title"><span>Инструменты <i>{agent.tools.length}/8</i></span></div><div className="tool-list">{agent.tools.map((tool) => <ToolRow key={tool.id} tool={tool} used={toolUsage ? (toolUsage[tool.type === "ascn" ? `ascn_${tool.name}` : tool.type === "dtmf" ? "ascn_press_digit" : String(tool.name || tool.type)] || 0) : undefined} onChange={(changes) => updateTool(tool.id, changes)} onDelete={() => patch({ tools: agent.tools.filter((item) => item.id !== tool.id) })} />)}</div>
+        <div className="tool-catalog">{toolCatalog(agent).map((entry) => <div key={entry.key} className="tool-offer"><i>{entry.icon}</i><div><strong>{entry.label}</strong><p>{entry.note}</p></div><button type="button" className="pill-button" disabled={agent.tools.length >= 8} onClick={() => addTool(entry.key)}>Добавить</button></div>)}</div></section>
       </>}
       {tab === "speech" && <section className="setting-block">
         <div className="setting-row"><div><strong>Голос</strong><p>Выберите голос, который подходит вашему делу. Частоты замерены на живом синтезе: у xAI мужских всего два.</p></div>
           <div className="row-control">
             <button type="button" className="text-button" disabled={preview.state === "loading" || !agent.voice} onClick={() => void playVoice()}><AudioLines size={14} /> {preview.state === "loading" ? "Генерирую…" : "Прослушать"}</button>
-            {transportOf(agent.provider) === "xai"
-              ? <select aria-label="Голос" value={agent.voice} onChange={(event) => patch({ voice: event.target.value })}>{!xaiVoices.some((voice) => voice.id === agent.voice) && <option value={agent.voice}>{agent.voice}</option>}{xaiVoices.map((voice) => <option key={voice.id} value={voice.id}>{voice.note ? `${voice.id} · ${voice.note}` : voice.id}</option>)}</select>
-              : <select aria-label="Голос" value={agent.voice} onChange={(event) => patch({ voice: event.target.value })}>{availableVoices.map((voice) => <option key={voice}>{voice}</option>)}</select>}
+            <VoiceLibrary agent={agent} onPick={(voice) => patch({ voice })} onPlay={(voice) => void playVoice(voice)} busyVoice={preview.state === "loading" ? busyVoice : ""} />
           </div>
           {preview.state === "error" && <small className="voice-preview-error">{preview.detail}</small>}
         </div>
@@ -756,13 +814,13 @@ function AgentEditor({ agent, setAgent, settings, saving, onSave, onPublish, onA
         <div className="setting-row"><div><strong>Ключевые слова</strong><p>Названия и артикулы, которые часто звучат в звонках — модель перестанет подменять их похожими.</p></div></div>
         <textarea className="soft-textarea" aria-label="Ключевые слова" rows={2} value={agent.keyterms} onChange={(event) => patch({ keyterms: event.target.value })} placeholder="New Balance, Air Force, СДЭК, 43 размер" />
 
-        {transportOf(agent.provider) === "yandex" && <div className="setting-row"><div><strong>Язык</strong><p>Улучшает распознавание, если звонящие говорят на одном языке.</p></div>
-          <select aria-label="Язык" value={agent.recognitionLanguage} onChange={(event) => patch({ recognitionLanguage: event.target.value })}><option value="auto">Автоопределение</option><option value="ru-RU">Русский</option><option value="kk-KZ">Казахский</option><option value="en-US">Английский</option><option value="uz-UZ">Узбекский</option></select>
-        </div>}
+        <div className="setting-row"><div><strong>Язык</strong><p>{transportOf(agent.provider) === "yandex" ? `Родной параметр распознавания ${providerLabels[agent.provider]}.` : `Подсказка распознаванию ${providerLabels[agent.provider]}: с ней реплики звонящего расшифровываются точнее.`}</p></div>
+          <select aria-label="Язык" value={agent.recognitionLanguage} onChange={(event) => patch({ recognitionLanguage: event.target.value })}><option value="auto">Автоопределение</option><option value="ru-RU">Русский</option><option value="en-US">Английский</option><option value="kk-KZ">Казахский</option><option value="uz-UZ">Узбекский</option><option value="tr-TR">Турецкий</option><option value="az-AZ">Азербайджанский</option></select>
+        </div>
 
-        {transportOf(agent.provider) === "yandex" && <div className="setting-row"><div><strong>Скорость речи</strong><p>Ускорить или замедлить агента.</p></div>
+        <div className="setting-row"><div><strong>Скорость речи</strong><p>{transportOf(agent.provider) === "xai" ? `${providerLabels[agent.provider]} не принимает темп настройкой — просьба говорить быстрее или медленнее уходит в промпт.` : `Родная настройка синтеза ${providerLabels[agent.provider]}.`}</p></div>
           <select aria-label="Скорость речи" value={String(agent.speed)} onChange={(event) => patch({ speed: Number(event.target.value) })}>{["0.8", "0.9", "1", "1.1", "1.2", "1.3", "1.5"].map((value) => <option key={value} value={value}>{value.replace(".", ",")}×</option>)}</select>
-        </div>}
+        </div>
 
         <div className="setting-row"><div><strong>Продолжение после паузы</strong><p>Подталкивать собеседника, когда он замолчал. Пауза задаётся ниже.</p></div>
           <label className="switch"><b className="sr-only">Продолжение после паузы</b><input type="checkbox" checked={agent.followUpSeconds > 0} onChange={(event) => patch({ followUpSeconds: event.target.checked ? 10 : 0 })} /><span /></label>

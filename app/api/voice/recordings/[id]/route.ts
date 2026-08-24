@@ -1,12 +1,16 @@
+import { tenantRoute } from "@/lib/guard";
+import { getCallRecord } from "@/lib/calls";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 
 const recordingsDirectory = path.join(process.env.DATA_DIR?.trim() || path.join(process.cwd(), ".data"), "recordings");
 
-export async function GET(_request: Request, context: { params: Promise<{ id: string }> }) {
+async function handleGET(_request: Request, context: { params: Promise<{ id: string }> }) {
   const { id } = await context.params;
   // Идентификатор подставляется в путь, поэтому пускаем только формат UUID.
   if (!/^[0-9a-f-]{36}$/i.test(id)) return new Response("Not found", { status: 404 });
+  // Файлы лежат в общем каталоге — отдаём только владельцу записи о звонке.
+  if (!(await getCallRecord(id))) return new Response("Not found", { status: 404 });
   const file = path.join(recordingsDirectory, `${id}.wav`);
   try {
     const info = await stat(file);
@@ -23,3 +27,5 @@ export async function GET(_request: Request, context: { params: Promise<{ id: st
     return new Response("Not found", { status: 404 });
   }
 }
+
+export const GET = tenantRoute(handleGET);

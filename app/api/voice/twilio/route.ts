@@ -1,6 +1,7 @@
+import { tenantRoute } from "@/lib/guard";
 // Проверка ключей Twilio: их API отвечает 401 на неверную пару SID/токен,
 // поэтому мы можем сказать сразу, а не после первого пропавшего звонка.
-export async function POST(request: Request) {
+async function handlePOST(request: Request) {
   const body = await request.json().catch(() => null) as { accountSid?: string; authToken?: string } | null;
   const accountSid = String(body?.accountSid || "").trim();
   const authToken = String(body?.authToken || "").trim();
@@ -19,3 +20,5 @@ export async function POST(request: Request) {
     return Response.json({ error: (error as Error).message }, { status: 502 });
   }
 }
+
+export const POST = tenantRoute(handlePOST);

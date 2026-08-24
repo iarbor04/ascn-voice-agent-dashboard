@@ -1,8 +1,17 @@
-import { canonicalPhone, getAsteriskEndpoint, getVoiceSettings, normalizeCallVariables, providerTransport, resolveAgentInstructions, resolveVoiceRoute, type VoiceTool } from "@/lib/voice-agents";
+import { canonicalPhone, findTenantByDid, getAsteriskEndpoint, getVoiceSettings, normalizeCallVariables, providerTransport, resolveAgentInstructions, resolveVoiceRoute, type VoiceTool } from "@/lib/voice-agents";
 import { createCallRecord, recordCallMetric, ensurePhoneContact, getCallRecord, getContact, listCallMessages, listMessagesSince, rememberPhoneNote, saveCallTranscript, updateCallRecord, updateContactStatus, updatePhoneContact, type CallStatus } from "@/lib/calls";
 import { analyzeCallTranscript } from "@/lib/call-analysis";
+import { currentTenantId, DEFAULT_TENANT, withTenant } from "@/lib/tenant-context";
 import { searchKnowledge } from "@/lib/knowledge";
 import { sendMail } from "@/lib/mailer";
+
+// Шлюз авторизован общим ключом, поэтому его tenantId мы принимаем на веру.
+// Входящий звонок тенанта не знает — владельца находим по набранному номеру.
+async function gatewayTenant(explicit: unknown, did: string) {
+  const claimed = String(explicit || "");
+  if (claimed === DEFAULT_TENANT || /^[0-9a-f-]{36}$/i.test(claimed)) return claimed;
+  return (did ? await findTenantByDid(did) : null) || DEFAULT_TENANT;
+}
 
 function authorized(request: Request) {
   const expected = process.env.INTERNAL_API_KEY?.trim();
@@ -31,6 +40,7 @@ async function buildSession(phone: string, did: string, agentId: string, variabl
   const contact = await ensurePhoneContact(phone);
   const messages = await listCallMessages(contact.id);
   return Response.json({
+    tenantId: currentTenantId(),
     agent: { ...agent, instructions: resolveAgentInstructions(agent, memoryText(messages, contact.notes || []), phone, variables), tools: agent.tools.map(publicTool) },
     ai: providerTransport(agent.provider) === "openai"
       ? { provider: "openai", apiKey: settings.openaiApiKey, projectId: settings.openaiProjectId }
@@ -100,12 +110,19 @@ async function notifyByMail(callId: string, outcome: Awaited<ReturnType<typeof a
 export async function GET(request: Request) {
   if (!authorized(request)) return new Response("Unauthorized", { status: 401 });
   const url = new URL(request.url);
-  return buildSession(canonicalPhone(url.searchParams.get("phone") || "") || "unknown", url.searchParams.get("did")?.slice(0, 60) || "", url.searchParams.get("agentId") || "", {});
+  const tenantId = await gatewayTenant(url.searchParams.get("tenantId"), url.searchParams.get("did") || "");
+  return withTenant(tenantId, () => buildSession(canonicalPhone(url.searchParams.get("phone") || "") || "unknown", url.searchParams.get("did")?.slice(0, 60) || "", url.searchParams.get("agentId") || "", {}));
 }
 
 export async function POST(request: Request) {
   if (!authorized(request)) return new Response("Unauthorized", { status: 401 });
   const body = await request.json().catch(() => null) as Record<string, unknown> | null;
+  const tenantId = await gatewayTenant(body?.tenantId, typeof body?.did === "string" ? body.did : "");
+  return withTenant(tenantId, () => handleAction(body, tenantId));
+}
+
+async function handleAction(body: Record<string, unknown> | null, tenantId: string) {
+  void tenantId;
   const phone = canonicalPhone(typeof body?.phone === "string" ? body.phone : "") || "unknown";
   if (body?.action === "session") {
     return buildSession(phone, typeof body.did === "string" ? body.did.slice(0, 60) : "", typeof body.agentId === "string" ? body.agentId : "", normalizeCallVariables(body.variables));

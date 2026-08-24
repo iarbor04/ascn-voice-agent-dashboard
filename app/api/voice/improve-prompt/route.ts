@@ -1,3 +1,4 @@
+import { tenantRoute } from "@/lib/guard";
 import { askTextModel } from "@/lib/text-model";
 import { aiProviders, getVoiceSettings, type AiProvider } from "@/lib/voice-agents";
 
@@ -9,7 +10,7 @@ const system = `Ты редактор системных промптов для
 - сохрани все подстановки вида {{variable}} и весь смысл исходного промпта, ничего не выдумывай про бизнес.
 Верни только готовый промпт, без пояснений, без markdown-заголовков и без кода.`;
 
-export async function POST(request: Request) {
+async function handlePOST(request: Request) {
   const body = await request.json().catch(() => null) as { provider?: string; instructions?: string; name?: string; description?: string } | null;
   const instructions = typeof body?.instructions === "string" ? body.instructions.trim().slice(0, 30000) : "";
   if (!instructions) return Response.json({ error: "Промпт пустой — сначала напишите основу" }, { status: 400 });
@@ -22,3 +23,5 @@ export async function POST(request: Request) {
     return Response.json({ error: (error as Error).message }, { status: 502 });
   }
 }
+
+export const POST = tenantRoute(handlePOST);

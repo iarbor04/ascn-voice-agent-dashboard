@@ -1,10 +1,11 @@
+import { tenantRoute } from "@/lib/guard";
 import { getVoiceSettings, saveVoiceSettings } from "@/lib/voice-agents";
 
-export async function GET() {
+async function handleGET() {
   return Response.json(await getVoiceSettings());
 }
 
-export async function PUT(request: Request) {
+async function handlePUT(request: Request) {
   const body = await request.json().catch(() => null);
   try {
     const settings = await saveVoiceSettings(body);
@@ -15,3 +16,6 @@ export async function PUT(request: Request) {
     return Response.json({ error: error instanceof Error ? error.message : "Не удалось сохранить подключение" }, { status: 400 });
   }
 }
+
+export const GET = tenantRoute(handleGET);
+export const PUT = tenantRoute(handlePUT);

@@ -1,3 +1,4 @@
+import { tenantRoute } from "@/lib/guard";
 import WebSocket from "ws";
 import { realtimeEndpoint } from "@/lib/realtime-endpoint";
 import { getVoiceSettings, providerLabels, type AiProvider } from "@/lib/voice-agents";
@@ -29,7 +30,7 @@ function openSession(probe: { url: string; headers: Record<string, string> }) {
   });
 }
 
-export async function POST(request: Request) {
+async function handlePOST(request: Request) {
   const body = await request.json().catch(() => null) as { provider?: string } | null;
   const providers = Object.keys(providerLabels) as AiProvider[];
   const provider = providers.find((item) => item === body?.provider);
@@ -38,3 +39,5 @@ export async function POST(request: Request) {
   if ("error" in probe) return Response.json({ ok: false, detail: probe.error });
   return Response.json({ provider, ...(await openSession(probe)) });
 }
+
+export const POST = tenantRoute(handlePOST);

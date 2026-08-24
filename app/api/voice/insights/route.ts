@@ -1,7 +1,8 @@
+import { tenantRoute } from "@/lib/guard";
 import { listCallRecords } from "@/lib/calls";
 import { aggregateCalls } from "@/lib/insights";
 
-export async function GET(request: Request) {
+async function handleGET(request: Request) {
   const url = new URL(request.url);
   const days = Math.min(90, Math.max(1, Number(url.searchParams.get("days")) || 7));
   const to = new Date();
@@ -12,3 +13,5 @@ export async function GET(request: Request) {
   const calls = all.filter((call) => call.createdAt >= from && call.createdAt <= to.toISOString());
   return Response.json({ days, from, to: to.toISOString(), ...aggregateCalls(calls, all) });
 }
+
+export const GET = tenantRoute(handleGET);
