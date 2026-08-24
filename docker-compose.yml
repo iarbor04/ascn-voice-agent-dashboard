@@ -1,4 +1,4 @@
-name: ascn-broadcast-crm
+name: ascn-voice-agent
 
 services:
   app:
@@ -7,21 +7,48 @@ services:
     init: true
     environment:
       DATA_DIR: /app/data
-      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-change-this-in-production}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
-      APP_URL: ${APP_URL:-}
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
-      WHATSAPP_ACCESS_TOKEN: ${WHATSAPP_ACCESS_TOKEN:-}
-      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
-      WHATSAPP_GRAPH_API_VERSION: ${WHATSAPP_GRAPH_API_VERSION:-}
-      WHATSAPP_APP_SECRET: ${WHATSAPP_APP_SECRET:-}
-      WHATSAPP_VERIFY_TOKEN: ${WHATSAPP_VERIFY_TOKEN:-}
+      VOICE_GATEWAY_INTERNAL_URL: http://voice-gateway:8787
     ports:
       - "${ASCN_HOST_PORT:-3000}:3000"
     volumes:
       - ascn_data:/app/data
+
+  voice-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.voice
+    restart: unless-stopped
+    init: true
+    environment:
+      ASCN_APP_URL: http://app:3000
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-change-this-in-production}
+      ASTERISK_HOST: asterisk
+      ASTERISK_AMI_PASSWORD: ascn-internal
+      RECORDINGS_DIR: /ascn-data/recordings
+    ports:
+      - "${ASCN_VOICE_GATEWAY_PORT:-8787}:8787"
+    volumes:
+      - ascn_data:/ascn-data
+    depends_on:
+      - app
+      - asterisk
+
+  asterisk:
+    build:
+      context: .
+      dockerfile: Dockerfile.asterisk
+    restart: unless-stopped
+    environment:
+      ASTERISK_EXTERNAL_IP: ${ASTERISK_EXTERNAL_IP:-}
+    ports:
+      - "${ASCN_SIP_PORT:-5060}:5060/udp"
+      - "${ASCN_SIP_PORT:-5060}:5060/tcp"
+      - "10000-10100:10000-10100/udp"
+    volumes:
+      - ascn_data:/ascn-data
 
 volumes:
   ascn_data:

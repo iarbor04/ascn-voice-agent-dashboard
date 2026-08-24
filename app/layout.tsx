@@ -20,21 +20,21 @@ export async function generateMetadata(): Promise<Metadata> {
   const previewImage = `${protocol}://${host}/og.png`;
 
   return {
-    title: "ASCN.AI Agent — Telegram & WhatsApp CRM",
-    description: "Лиды, диалоги, мультиязычные рассылки и автоцепочки в одном кабинете.",
+    title: "ASCN.AI Voice — голосовые AI-агенты",
+    description: "Голосовые агенты Yandex AI Studio и OpenAI Realtime для обычных телефонных номеров и SIP.",
     icons: {
       icon: "/emblem.svg",
       shortcut: "/emblem.svg",
     },
     openGraph: {
-      title: "ASCN.AI Agent — Telegram & WhatsApp CRM",
-      description: "Лиды, диалоги, мультиязычные рассылки и автоцепочки в одном кабинете.",
+      title: "ASCN.AI Voice — голосовые AI-агенты",
+      description: "Голосовые агенты Yandex AI Studio и OpenAI Realtime для обычных телефонных номеров и SIP.",
       images: [previewImage],
     },
     twitter: {
       card: "summary_large_image",
-      title: "ASCN.AI Agent — Telegram & WhatsApp CRM",
-      description: "Лиды, диалоги, мультиязычные рассылки и автоцепочки в одном кабинете.",
+      title: "ASCN.AI Voice — голосовые AI-агенты",
+      description: "Голосовые агенты Yandex AI Studio и OpenAI Realtime для обычных телефонных номеров и SIP.",
       images: [previewImage],
     },
   };

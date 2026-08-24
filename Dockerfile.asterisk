@@ -1,0 +1,9 @@
+FROM alpine:3.21
+RUN apk add --no-cache asterisk asterisk-curl asterisk-sample-config
+COPY asterisk/pjsip.conf /etc/asterisk/pjsip.conf
+COPY asterisk/extensions.conf /etc/asterisk/extensions.conf
+COPY asterisk/manager.conf /etc/asterisk/manager.conf
+COPY asterisk/rtp.conf /etc/asterisk/rtp.conf
+COPY asterisk/entrypoint.sh /usr/local/bin/ascn-entrypoint
+EXPOSE 5060/udp 5060/tcp 10000-10100/udp
+CMD ["/usr/local/bin/ascn-entrypoint"]

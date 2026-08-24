@@ -40,3 +40,4 @@ yarn-error.log*
 /dist/
 /.wrangler/
 /.data/
+tsconfig.tsbuildinfo
