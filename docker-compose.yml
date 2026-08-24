@@ -26,7 +26,7 @@ services:
       ASCN_APP_URL: http://app:3000
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-change-this-in-production}
       ASTERISK_HOST: asterisk
-      ASTERISK_AMI_PASSWORD: ascn-internal
+      ASTERISK_AMI_PASSWORD: ${ASTERISK_AMI_PASSWORD:-ascn-internal}
       RECORDINGS_DIR: /ascn-data/recordings
     ports:
       - "${ASCN_VOICE_GATEWAY_PORT:-8787}:8787"
@@ -43,6 +43,7 @@ services:
     restart: unless-stopped
     environment:
       ASTERISK_EXTERNAL_IP: ${ASTERISK_EXTERNAL_IP:-}
+      ASTERISK_AMI_PASSWORD: ${ASTERISK_AMI_PASSWORD:-ascn-internal}
     ports:
       - "${ASCN_SIP_PORT:-5060}:5060/udp"
       - "${ASCN_SIP_PORT:-5060}:5060/tcp"
