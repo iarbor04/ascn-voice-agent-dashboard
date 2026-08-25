@@ -18,6 +18,9 @@
 /.next/
 /.vinext/
 /out/
+/frontend/.nuxt/
+/frontend/.output/
+/frontend/node_modules/
 
 # misc
 .DS_Store

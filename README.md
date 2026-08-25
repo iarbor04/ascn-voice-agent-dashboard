@@ -2,6 +2,11 @@
 
 Отдельная админка голосовых AI-агентов на Yandex AI Studio и OpenAI Realtime. Это самостоятельный проект: в нём нет Telegram, WhatsApp, рассылок и автоцепочек.
 
+Интерфейс работает на **Nuxt 4 + Vue 3**. Существующий Next.js-сервис оставлен
+как внутренний backend/API, чтобы не менять проверенную телефонию, авторизацию и
+контракты данных. В Docker наружу публикуется только Nuxt; запросы `/api/**`
+прозрачно передаются внутреннему backend-контейнеру.
+
 ## Что входит
 
 - Yandex Speech Realtime и OpenAI GPT Realtime в одном конструкторе;
@@ -87,6 +92,10 @@ node scripts/generate-deployment-env.mjs .env IP-СЕРВЕРА 3000
 docker compose up -d --build
 ```
 
+Для разработки frontend отдельно: `npm ci --prefix frontend --legacy-peer-deps`,
+затем `NUXT_BACKEND_URL=http://127.0.0.1:3000 npm run frontend:dev`. Backend в
+это время запускается обычной командой `npm run dev`.
+
 Compose намеренно не содержит секретов по умолчанию и не стартует с короткими
 или совпадающими internal keys. PostgreSQL, Redis и MinIO используют разные
 runtime-учётные записи; root/superuser credentials приложению не передаются.
@@ -159,7 +168,7 @@ wss://voice.example.ru/voice-ws/session
 
 ## Порты
 
-- `3000/tcp` — админка;
+- `3000/tcp` — Nuxt-админка; backend доступен только внутри Compose как `app:3000`;
 - `8787/tcp` — browser voice gateway, публиковать только через HTTPS/WSS reverse proxy;
 - `5060/udp,tcp` — SIP;
 - `10000-10100/udp` — RTP.
