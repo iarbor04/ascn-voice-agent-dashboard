@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { scryptSync } from "node:crypto";
 import { createServer } from "node:net";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -9,19 +10,86 @@ import test, { after, before } from "node:test";
 const port = 3138;
 const baseUrl = `http://127.0.0.1:${port}`;
 const authorization = `Basic ${Buffer.from("admin:test-admin-password").toString("base64")}`;
+const gatewayAuthorization = "Bearer test-gateway-to-app-key-6e02346f";
+const externalCallAuthorization = "Bearer test-external-call-key-df715d55";
+const collisionTenantId = "11111111-1111-4111-8111-111111111111";
+const collisionTenantEmail = "sip-collision@example.test";
+const collisionTenantPassword = "test-collision-password";
+const collisionTenantSalt = "7b2452db48dfef53ef51f391235ac283";
 let server;
 let dataDirectory;
+let serverOutput = "";
+
+async function databaseTestQuery(query, values = []) {
+  const { Client } = await import("pg");
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    return await client.query(query, values);
+  } finally {
+    await client.end();
+  }
+}
+
+const legacyStore = {
+  agents: [{
+    id: "legacy-agent", name: "Старый агент", description: "", provider: "xai", model: "grok-voice-think-fast-2.0",
+    instructions: "Ты продавец.", variables: [], tools: [], synthesisEnabled: true, voice: "xai_sal", role: "",
+    speed: 1, recognitionLanguage: "auto", vadEnabled: true, vadThreshold: 0.5, silenceDurationMs: 400,
+    speaksFirst: true, firstMessage: "Здравствуйте!", active: true,
+    createdAt: "2026-08-01T00:00:00.000Z", updatedAt: "2026-08-01T00:00:00.000Z",
+  }],
+  settings: {},
+};
 
 before(async () => {
+  assert.ok(process.env.DATABASE_URL, "DATABASE_URL must point to the test PostgreSQL service");
+  assert.ok(process.env.REDIS_URL, "REDIS_URL must point to the test Redis service");
   dataDirectory = await mkdtemp(join(tmpdir(), "ascn-voice-test-"));
-  server = spawn("npm", ["start", "--", "-p", String(port)], { stdio: "ignore", env: { ...process.env, DATA_DIR: dataDirectory, INTERNAL_API_KEY: "test-internal-key", ADMIN_USERNAME: "admin", ADMIN_PASSWORD: "test-admin-password" } });
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    try { const response = await fetch(baseUrl, { headers: { authorization } }); if (response.ok) return; } catch { /* Server is still starting. */ }
+  await writeFile(join(dataDirectory, "voice-agents.json"), JSON.stringify(legacyStore), { encoding: "utf8", mode: 0o600 });
+  await writeFile(join(dataDirectory, "users.json"), JSON.stringify({
+    users: [{
+      id: collisionTenantId,
+      email: collisionTenantEmail,
+      passwordHash: scryptSync(collisionTenantPassword, collisionTenantSalt, 64).toString("hex"),
+      salt: collisionTenantSalt,
+      createdAt: "2026-08-01T00:00:00.000Z",
+    }],
+    sessions: [],
+  }), { encoding: "utf8", mode: 0o600 });
+  server = spawn("npm", ["start", "--", "-p", String(port)], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      LEGACY_DATA_DIR: dataDirectory,
+      ASTERISK_CONFIG_DIR: join(dataDirectory, "asterisk"),
+      GATEWAY_APP_KEY: gatewayAuthorization.slice("Bearer ".length),
+      APP_GATEWAY_KEY: "test-app-to-gateway-key-20c37b1a",
+      BROWSER_TOKEN_SECRET: "test-browser-token-secret-7c7a6103",
+      EXTERNAL_CALL_API_KEY: externalCallAuthorization.slice("Bearer ".length),
+      ADMIN_USERNAME: "admin",
+      ADMIN_PASSWORD: "test-admin-password",
+      TRUST_PROXY: "false",
+      ALLOW_PUBLIC_REGISTRATION: "true",
+      DIRECT_SIP_RESERVATIONS: JSON.stringify({
+        default: ["212.53.40.1"],
+        [collisionTenantId]: ["212.53.40.1"],
+      }),
+    },
+  });
+  for (const stream of [server.stdout, server.stderr]) {
+    stream.on("data", (chunk) => { serverOutput = `${serverOutput}${chunk}`.slice(-20_000); });
+  }
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try { const response = await fetch(`${baseUrl}/api/health`); if (response.ok) return; } catch { /* Server or its stateful dependencies are still starting. */ }
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
-  throw new Error("Production server did not start");
+  throw new Error(`Production server did not start:\n${serverOutput}`);
 });
-after(async () => { server?.kill("SIGTERM"); await rm(dataDirectory, { recursive: true, force: true }); });
+after(async () => {
+  server?.kill("SIGTERM");
+  if (dataDirectory) await rm(dataDirectory, { recursive: true, force: true });
+});
 
 test("renders the standalone voice dashboard without messaging products", async () => {
   const response = await fetch(baseUrl, { headers: { authorization } });
@@ -47,6 +115,74 @@ test("protects the dashboard", async () => {
   assert.match(basic.headers.get("www-authenticate") || "", /ASCN Voice/);
 });
 
+test("login form accepts the service admin username without an email @ sign", async () => {
+  const response = await fetch(`${baseUrl}/login`);
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /Логин или почта/);
+  assert.match(html, /autocomplete="username"/i);
+  assert.doesNotMatch(html, /type="email"/i);
+});
+
+test("keeps the public health check read-only", async () => {
+  const callId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+  await databaseTestQuery(
+    `INSERT INTO ascn_call_records
+       (tenant_id, id, direction, phone, agent_id, agent_name, provider, model,
+        status, variables, error, outcome, first_audio_ms, tool_calls, transfers,
+        tool_usage, recorded_seconds, created_at, updated_at, ended_at)
+     VALUES
+       ('default', $1, 'inbound', '+79990001122', '', '', '', '', 'live',
+        '{}'::jsonb, '', NULL, 0, 0, 0, '{}'::jsonb, 0,
+        now() - interval '4 hours', now() - interval '4 hours', NULL)
+     ON CONFLICT (tenant_id, id) DO UPDATE SET
+       status = 'live', updated_at = now() - interval '4 hours', ended_at = NULL`,
+    [callId],
+  );
+  try {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const health = await fetch(`${baseUrl}/api/health`);
+      assert.equal(health.status, 200);
+    }
+    const result = await databaseTestQuery(
+      "SELECT status, ended_at FROM ascn_call_records WHERE tenant_id = 'default' AND id = $1",
+      [callId],
+    );
+    assert.equal(result.rows[0]?.status, "live", "readiness probe must not reconcile application state");
+    assert.equal(result.rows[0]?.ended_at, null);
+  } finally {
+    await databaseTestQuery(
+      "DELETE FROM ascn_call_records WHERE tenant_id = 'default' AND id = $1",
+      [callId],
+    );
+  }
+});
+
+test("without a trusted proxy, login attempts do not share one global IP bucket", async () => {
+  for (let attempt = 0; attempt < 22; attempt += 1) {
+    const response = await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: `no-proxy-probe-${attempt}@example.test`, password: "not-the-password" }),
+    });
+    assert.equal(response.status, 401, `attempt ${attempt + 1} must be limited only by its email identity`);
+  }
+});
+
+test("environment administrator can sign in through the browser form", async () => {
+  const response = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: "admin", password: "test-admin-password" }),
+  });
+  assert.equal(response.status, 200);
+  const cookie = response.headers.get("set-cookie") || "";
+  assert.match(cookie, /ascn_session=[0-9a-f]{64}/);
+  const me = await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie } });
+  assert.equal(me.status, 200);
+  assert.deepEqual(await me.json(), { email: "admin", kind: "session" });
+});
+
 test("cancels the active response when the caller interrupts", async () => {
   const gateway = await readFile(new URL("../voice-gateway/server.mjs", import.meta.url), "utf8");
   assert.match(gateway, /input_audio_buffer\.speech_started/);
@@ -54,9 +190,16 @@ test("cancels the active response when the caller interrupts", async () => {
 });
 
 test("routes a phone number to an agent and keeps all provider secrets server-side", async () => {
-  const createResponse = await fetch(`${baseUrl}/api/voice/agents`, { method: "POST", headers: { authorization, "content-type": "application/json" }, body: JSON.stringify({ name: "Поддержка", provider: "yandex", model: "speech-realtime-260528", instructions: "Ты оператор {{service_name}}", variables: [{ id: "service", key: "service_name", value: "ASCN" }], tools: [{ id: "memory", type: "ascn", name: "contact_context" }, { id: "search", type: "web_search" }], synthesisEnabled: true, voice: "filipp", speed: 1, recognitionLanguage: "ru-RU", vadEnabled: true, vadThreshold: 0.5, silenceDurationMs: 800, speaksFirst: true, firstMessage: "Здравствуйте", active: true }) });
+  const createResponse = await fetch(`${baseUrl}/api/voice/agents`, { method: "POST", headers: { authorization, "content-type": "application/json" }, body: JSON.stringify({ name: "Поддержка", provider: "yandex", model: "speech-realtime-260528", instructions: "Ты оператор {{service_name}}", variables: [{ id: "service", key: "service_name", value: "ASCN" }], tools: [{ id: "memory", type: "ascn", name: "contact_context" }, { id: "search", type: "web_search" }, { id: "private-mcp", type: "mcp", label: "CRM", url: "https://mcp.example.test", authorization: "Bearer dashboard-must-not-leak", requireApproval: "never" }, { id: "private-function", type: "function", name: "lookup_order", description: "Ищет заказ", parameters: "{}", webhookUrl: "https://hooks.example.test/order", authorization: "function-secret-must-not-leak" }], synthesisEnabled: true, voice: "filipp", speed: 1, recognitionLanguage: "ru-RU", vadEnabled: true, vadThreshold: 0.5, silenceDurationMs: 800, speaksFirst: true, firstMessage: "Здравствуйте", active: true }) });
   assert.equal(createResponse.status, 201);
   const agent = (await createResponse.json()).agent;
+  assert.doesNotMatch(JSON.stringify(agent), /dashboard-must-not-leak|function-secret-must-not-leak/, "секреты инструментов не возвращаются в черновике");
+  assert.equal(agent.tools.find((tool) => tool.id === "private-mcp").authorizationConfigured, true);
+  const publishResponse = await fetch(`${baseUrl}/api/voice/agents/publish`, { method: "POST", headers: { authorization, "content-type": "application/json" }, body: JSON.stringify({ id: agent.id }) });
+  assert.equal(publishResponse.status, 200);
+  const publishedAgent = (await publishResponse.json()).agent;
+  assert.doesNotMatch(JSON.stringify(publishedAgent), /dashboard-must-not-leak|function-secret-must-not-leak/, "секреты инструментов не возвращаются и из опубликованного снимка");
+  assert.equal(publishedAgent.published.tools.find((tool) => tool.id === "private-function").authorizationConfigured, true);
 
   const settingsResponse = await fetch(`${baseUrl}/api/voice/settings`, { method: "PUT", headers: { authorization, "content-type": "application/json" }, body: JSON.stringify({ yandexFolderId: "folder-test", yandexApiKey: "secret-yandex", openaiApiKey: "secret-openai", openaiProjectId: "proj_test", gatewayPublicUrl: "wss://voice.example.test/voice-ws/session", phoneConnections: [{ id: "main-number", name: "Основной номер", providerPreset: "custom", enabled: true, number: "+79990000000", agentId: agent.id, registrar: "sip.example.test", proxy: "", username: "sip-user", password: "secret-sip", transport: "udp", operatorExtension: "+79991111111" }] }) });
   assert.equal(settingsResponse.status, 200);
@@ -68,7 +211,7 @@ test("routes a phone number to an agent and keeps all provider secrets server-si
   assert.equal("openaiApiKey" in safe, false);
   assert.equal("password" in safe.phoneConnections[0], false);
 
-  const runtimeResponse = await fetch(`${baseUrl}/api/voice/runtime?did=79990000000&phone=%2B79991234567`, { headers: { authorization: "Bearer test-internal-key" } });
+  const runtimeResponse = await fetch(`${baseUrl}/api/voice/runtime?tenantId=default&connectionId=main-number&direction=inbound&did=79990000000&phone=%2B79991234567`, { headers: { authorization: gatewayAuthorization } });
   assert.equal(runtimeResponse.status, 200);
   const runtime = await runtimeResponse.json();
   assert.match(runtime.agent.instructions, /ASCN/);
@@ -76,12 +219,52 @@ test("routes a phone number to an agent and keeps all provider secrets server-si
   assert.equal(runtime.telephony.connectionId, "main-number");
   assert.equal(runtime.contact.phone, "+79991234567");
 
-  const transcript = await fetch(`${baseUrl}/api/voice/runtime`, { method: "POST", headers: { authorization: "Bearer test-internal-key", "content-type": "application/json" }, body: JSON.stringify({ action: "transcript", phone: "+79991234567", direction: "inbound", text: "Нужна помощь" }) });
+  const transcript = await fetch(`${baseUrl}/api/voice/runtime`, { method: "POST", headers: { authorization: gatewayAuthorization, "content-type": "application/json" }, body: JSON.stringify({ action: "transcript", tenantId: "default", phone: "+79991234567", direction: "inbound", text: "Нужна помощь" }) });
   assert.equal(transcript.status, 200);
+  assert.equal((await transcript.json()).message.callId, null, "browser transcript без callId остаётся в истории контакта");
   const contacts = (await (await fetch(`${baseUrl}/api/calls`, { headers: { authorization } })).json()).contacts;
   assert.equal(contacts[0].lastMessage, "Нужна помощь");
   const messages = (await (await fetch(`${baseUrl}/api/calls/${encodeURIComponent(contacts[0].id)}/messages`, { headers: { authorization } })).json()).messages;
   assert.equal(messages[0].text, "Нужна помощь");
+
+  const startCall = async () => {
+    const response = await fetch(`${baseUrl}/api/voice/runtime`, {
+      method: "POST",
+      headers: { authorization: gatewayAuthorization, "content-type": "application/json" },
+      body: JSON.stringify({ action: "call_started", tenantId: "default", direction: "inbound", phone: "+79991234567", connectionId: "main-number", did: "79990000000" }),
+    });
+    assert.equal(response.status, 200);
+    return (await response.json()).call;
+  };
+  const firstCall = await startCall();
+  const secondCall = await startCall();
+  for (const [callId, text] of [[firstCall.id, "Только первый звонок"], [secondCall.id, "Только второй звонок"]]) {
+    const response = await fetch(`${baseUrl}/api/voice/runtime`, {
+      method: "POST",
+      headers: { authorization: gatewayAuthorization, "content-type": "application/json" },
+      body: JSON.stringify({ action: "transcript", tenantId: "default", callId, phone: "+79991234567", direction: "inbound", text }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).message.callId, callId);
+  }
+  const firstCallDetails = await fetch(`${baseUrl}/api/voice/calls/${firstCall.id}`, { headers: { authorization } });
+  assert.equal(firstCallDetails.status, 200);
+  assert.deepEqual((await firstCallDetails.json()).messages.map((message) => message.text), ["Только первый звонок"], "карточка звонка не смешивает соседние разговоры одного контакта");
+
+  const terminalStatus = async (status, error) => {
+    const response = await fetch(`${baseUrl}/api/voice/runtime`, {
+      method: "POST",
+      headers: { authorization: gatewayAuthorization, "content-type": "application/json" },
+      body: JSON.stringify({ action: "call_status", tenantId: "default", callId: firstCall.id, status, error }),
+    });
+    assert.equal(response.status, 200);
+    return (await response.json()).call;
+  };
+  const failed = await terminalStatus("failed", "original terminal reason");
+  assert.equal(failed.status, "failed");
+  const duplicate = await terminalStatus("ended", "late close must not overwrite");
+  assert.equal(duplicate.status, "failed", "terminal state is immutable across durable outbox retries");
+  assert.equal(duplicate.error, "original terminal reason");
 
   const tokenResponse = await fetch(`${baseUrl}/api/voice/test-token`, { method: "POST", headers: { authorization, "content-type": "application/json" }, body: JSON.stringify({ agentId: agent.id }) });
   assert.equal(tokenResponse.status, 200);
@@ -104,9 +287,13 @@ test("reads a call outcome out of a noisy model answer", async () => {
 test("guards the outbound call API", async () => {
   const anonymous = await fetch(`${baseUrl}/api/voice/calls`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
   assert.equal(anonymous.status, 401);
+  const gatewayKeyOnCallApi = await fetch(`${baseUrl}/api/voice/calls`, { method: "POST", headers: { authorization: gatewayAuthorization, "content-type": "application/json" }, body: "{}" });
+  assert.equal(gatewayKeyOnCallApi.status, 401, "ключ шлюза не открывает внешний API звонков");
+  const externalKeyOnRuntime = await fetch(`${baseUrl}/api/voice/runtime?tenantId=default&direction=browser`, { headers: { authorization: externalCallAuthorization } });
+  assert.equal(externalKeyOnRuntime.status, 401, "внешний ключ звонков не открывает внутренний runtime");
   const badNumber = await fetch(`${baseUrl}/api/voice/calls`, {
     method: "POST",
-    headers: { authorization: "Bearer test-internal-key", "content-type": "application/json" },
+    headers: { authorization: externalCallAuthorization, "content-type": "application/json" },
     body: JSON.stringify({ toNumber: "12" }),
   });
   assert.equal(badNumber.status, 400);
@@ -129,12 +316,12 @@ test("treats DeepSeek as its own provider but keeps the Yandex transport", async
   assert.equal(agent.provider, "deepseek");
   assert.equal(agent.model, "speech-realtime-deepseek-v4-flash");
 
-  const runtime = await fetch(`${baseUrl}/api/voice/runtime?phone=%2B79995550000&agentId=${agent.id}`, { headers: { authorization: "Bearer test-internal-key" } });
+  const runtime = await fetch(`${baseUrl}/api/voice/runtime?tenantId=default&direction=browser&phone=%2B79995550000&agentId=${agent.id}`, { headers: { authorization: gatewayAuthorization } });
   assert.equal(runtime.status, 409);
   assert.match((await runtime.json()).error, /выключен/i);
 
   await fetch(`${baseUrl}/api/voice/agents`, { method: "PUT", headers: { authorization, "content-type": "application/json" }, body: JSON.stringify({ ...agent, active: true }) });
-  const live = await fetch(`${baseUrl}/api/voice/runtime?phone=%2B79995550000&agentId=${agent.id}`, { headers: { authorization: "Bearer test-internal-key" } });
+  const live = await fetch(`${baseUrl}/api/voice/runtime?tenantId=default&direction=browser&phone=%2B79995550000&agentId=${agent.id}`, { headers: { authorization: gatewayAuthorization } });
   assert.equal(live.status, 200);
   const session = await live.json();
   assert.equal(session.agent.provider, "deepseek");
@@ -199,7 +386,7 @@ test("keeps xAI as its own transport with its own key", async () => {
   const agent = (await created.json()).agent;
   assert.equal(agent.provider, "xai");
 
-  const runtime = await fetch(`${baseUrl}/api/voice/runtime?phone=%2B79995550001&agentId=${agent.id}`, { headers: { authorization: "Bearer test-internal-key" } });
+  const runtime = await fetch(`${baseUrl}/api/voice/runtime?tenantId=default&direction=browser&phone=%2B79995550001&agentId=${agent.id}`, { headers: { authorization: gatewayAuthorization } });
   assert.equal(runtime.status, 409);
   assert.match((await runtime.json()).error, /xAI/);
 });
@@ -283,37 +470,60 @@ test("уважает запрет перебивать и напоминает �
   assert.match(gateway, /upstream\.on\("close", \(\) => \{ clearTimeout\(followUpTimer\)/, "таймер снимается при закрытии сессии");
 });
 
-test("дополняет агентов, сохранённых до новых настроек", async () => {
-  const storePath = join(dataDirectory, "voice-agents.json");
-  const before = await readFile(storePath, "utf8").catch(() => "");
-  const legacy = {
-    agents: [{
-      id: "legacy-agent", name: "Старый агент", description: "", provider: "xai", model: "grok-voice-think-fast-2.0",
-      instructions: "Ты продавец.", variables: [], tools: [], synthesisEnabled: true, voice: "xai_sal", role: "",
-      speed: 1, recognitionLanguage: "auto", vadEnabled: true, vadThreshold: 0.5, silenceDurationMs: 400,
-      speaksFirst: true, firstMessage: "Здравствуйте!", active: true,
-      createdAt: "2026-08-01T00:00:00.000Z", updatedAt: "2026-08-01T00:00:00.000Z",
-    }],
-    settings: {},
+test("импортирует legacy JSON в PostgreSQL и дополняет старых агентов", async () => {
+  const response = await fetch(`${baseUrl}/api/voice/agents`, { headers: { authorization } });
+  assert.equal(response.status, 200);
+  const agent = (await response.json()).agents.find((item) => item.id === "legacy-agent");
+  assert.ok(agent, "legacy-запись, созданная до старта, импортирована в PostgreSQL");
+  assert.equal(agent.guardrails, "");
+  assert.deepEqual(agent.pronunciations, []);
+  assert.equal(agent.keyterms, "");
+  assert.equal(agent.followUpSeconds, 0);
+  assert.equal(agent.allowInterruptions, true, "перебивания по умолчанию разрешены");
+  assert.equal(agent.shareCallerNumber, true);
+  assert.equal(agent.timezone, "Europe/Moscow");
+  assert.equal(agent.updatedAt, "2026-08-01T00:00:00.000Z", "импорт не переписывает дату изменения");
+
+  const normalized = await databaseTestQuery(`
+    SELECT
+      (SELECT count(*)::integer FROM ascn_voice_stores) AS legacy_rows,
+      (SELECT count(*)::integer FROM ascn_voice_settings WHERE tenant_id = 'default') AS settings_rows,
+      (SELECT count(*)::integer FROM ascn_voice_agents WHERE tenant_id = 'default' AND id = 'legacy-agent') AS agent_rows
+  `);
+  assert.deepEqual(normalized.rows[0], { legacy_rows: 0, settings_rows: 1, agent_rows: 1 }, "legacy blob перенесён и удалён после проверки normalized rows");
+});
+
+test("редактирование агента обновляет только его PostgreSQL row", async () => {
+  const create = async (name) => {
+    const response = await fetch(`${baseUrl}/api/voice/agents`, {
+      method: "POST",
+      headers: { authorization, "content-type": "application/json" },
+      body: JSON.stringify({ name, instructions: `Промпт ${name}`, provider: "yandex", model: "speech-realtime-260528" }),
+    });
+    assert.equal(response.status, 201);
+    return (await response.json()).agent;
   };
-  try {
-    await writeFile(storePath, JSON.stringify(legacy), "utf8");
-    const response = await fetch(`${baseUrl}/api/voice/agents`, { headers: { authorization } });
-    assert.equal(response.status, 200);
-    const agent = (await response.json()).agents.find((item) => item.id === "legacy-agent");
-    assert.ok(agent, "старая запись читается, а не отбрасывается");
-    assert.equal(agent.guardrails, "");
-    assert.deepEqual(agent.pronunciations, []);
-    assert.equal(agent.keyterms, "");
-    assert.equal(agent.followUpSeconds, 0);
-    assert.equal(agent.allowInterruptions, true, "перебивания по умолчанию разрешены");
-    assert.equal(agent.shareCallerNumber, true);
-    assert.equal(agent.timezone, "Europe/Moscow");
-    assert.equal(agent.updatedAt, "2026-08-01T00:00:00.000Z", "чтение не переписывает дату изменения");
-  } finally {
-    if (before) await writeFile(storePath, before, "utf8");
-    else await rm(storePath, { force: true });
-  }
+  const edited = await create("Изменяемая строка");
+  const untouched = await create("Контрольная строка");
+  const before = await databaseTestQuery(
+    "SELECT xmin::text AS version, agent FROM ascn_voice_agents WHERE tenant_id = 'default' AND id = $1",
+    [untouched.id],
+  );
+
+  const update = await fetch(`${baseUrl}/api/voice/agents`, {
+    method: "PUT",
+    headers: { authorization, "content-type": "application/json" },
+    body: JSON.stringify({ ...edited, name: "Изменена только одна строка" }),
+  });
+  assert.equal(update.status, 200);
+  const after = await databaseTestQuery(
+    "SELECT xmin::text AS version, agent FROM ascn_voice_agents WHERE tenant_id = 'default' AND id = $1",
+    [untouched.id],
+  );
+  assert.deepEqual(after.rows[0], before.rows[0], "чужой JSONB и MVCC version не переписаны");
+
+  await fetch(`${baseUrl}/api/voice/agents?id=${edited.id}`, { method: "DELETE", headers: { authorization } });
+  await fetch(`${baseUrl}/api/voice/agents?id=${untouched.id}`, { method: "DELETE", headers: { authorization } });
 });
 
 test("отправляет письмо после звонка своим SMTP-клиентом", async () => {
@@ -427,8 +637,8 @@ test("звонки идут по опубликованному снимку, а
 
   const session = await (await fetch(`${baseUrl}/api/voice/runtime`, {
     method: "POST",
-    headers: { authorization: "Bearer test-internal-key", ...json },
-    body: JSON.stringify({ action: "session", phone: "+79991234567", agentId: created.id }),
+    headers: { authorization: gatewayAuthorization, ...json },
+    body: JSON.stringify({ action: "session", tenantId: "default", direction: "browser", phone: "+79991234567", agentId: created.id }),
   })).json();
   assert.match(session.agent.instructions, /ПЕРВАЯ ВЕРСИЯ/, "звонок идёт по опубликованному промпту");
   assert.doesNotMatch(session.agent.instructions, /ВТОРАЯ ВЕРСИЯ/, "черновик в звонок не попадает");
@@ -437,8 +647,8 @@ test("звонки идут по опубликованному снимку, а
   assert.equal(republished.unpublished, false, "после повторной публикации расхождения нет");
   const after = await (await fetch(`${baseUrl}/api/voice/runtime`, {
     method: "POST",
-    headers: { authorization: "Bearer test-internal-key", ...json },
-    body: JSON.stringify({ action: "session", phone: "+79991234567", agentId: created.id }),
+    headers: { authorization: gatewayAuthorization, ...json },
+    body: JSON.stringify({ action: "session", tenantId: "default", direction: "browser", phone: "+79991234567", agentId: created.id }),
   })).json();
   assert.match(after.agent.instructions, /ВТОРАЯ ВЕРСИЯ/, "новая версия ушла в звонки");
 
@@ -446,43 +656,81 @@ test("звонки идут по опубликованному снимку, а
   assert.equal(removed.live, false, "публикацию можно снять");
   const fallback = await (await fetch(`${baseUrl}/api/voice/runtime`, {
     method: "POST",
-    headers: { authorization: "Bearer test-internal-key", ...json },
-    body: JSON.stringify({ action: "session", phone: "+79991234567", agentId: created.id }),
+    headers: { authorization: gatewayAuthorization, ...json },
+    body: JSON.stringify({ action: "session", tenantId: "default", direction: "browser", phone: "+79991234567", agentId: created.id }),
   })).json();
   assert.match(fallback.agent.instructions, /ВТОРАЯ ВЕРСИЯ/, "без снимка звонки идут по черновику — старые агенты не ломаются");
 
   await fetch(`${baseUrl}/api/voice/agents?id=${created.id}`, { method: "DELETE", headers: { authorization } });
 });
 
-test("прямой SIP описывается в Asterisk без регистрации, по адресам оператора", async () => {
+test("прямой SIP пускает только зарезервированный точный public IP", async () => {
   const source = await readFile(new URL("../lib/voice-agents.ts", import.meta.url), "utf8");
   assert.match(source, /type=identify/, "прямой режим опознаёт звонок по адресу отправителя");
   assert.match(source, /item\.mode === "direct" \? item\.allowedAddresses\.length > 0/, "без списка адресов транк не считается готовым");
 
-  const dataDirectoryForSip = await mkdtemp(join(tmpdir(), "ascn-sip-"));
-  process.env.DATA_DIR = dataDirectoryForSip;
-  try {
-    const { saveVoiceSettings } = await import(`../lib/voice-agents.ts?sip=${encodeURIComponent(dataDirectoryForSip)}`);
-    // Без query: контекст должен быть тем же экземпляром, что видит хранилище.
-    const { withTenant } = await import("../lib/tenant-context.ts");
-    await withTenant("default", () => saveVoiceSettings({
+  const rejected = await fetch(`${baseUrl}/api/voice/settings`, {
+    method: "PUT",
+    headers: { authorization, "content-type": "application/json" },
+    body: JSON.stringify({
       phoneConnections: [
         { id: "direct-1", name: "СИПНЕТ прямой", number: "74951234567", mode: "direct", transport: "udp", registrar: "sipnet.ru", allowedAddresses: ["212.53.40.0/24", "sipnet.ru", "не адрес", "999.999.999.999", "10.0.0.1/64", "1.2.3.4/24/8"] },
+      ],
+    }),
+  });
+  assert.equal(rejected.status, 400, "широкие CIDR и DNS не могут стать tenant identity");
+
+  const response = await fetch(`${baseUrl}/api/voice/settings`, {
+    method: "PUT",
+    headers: { authorization, "content-type": "application/json" },
+    body: JSON.stringify({
+      phoneConnections: [
+        { id: "direct-1", name: "СИПНЕТ прямой", number: "74951234567", mode: "direct", transport: "udp", registrar: "sipnet.ru", allowedAddresses: ["212.53.40.1/32"] },
         { id: "reg-1", name: "СИПНЕТ регистрация", number: "74951234568", mode: "register", registrar: "sipnet.ru", username: "0000000000", password: "secret", transport: "udp" },
       ],
-    }));
-    const config = await readFile(join(dataDirectoryForSip, "asterisk", "pjsip-provider.conf"), "utf8");
+    }),
+  });
+  assert.equal(response.status, 200);
+  const config = await readFile(join(dataDirectory, "asterisk", "pjsip-provider.conf"), "utf8");
 
-    assert.match(config, /match=212\.53\.40\.0\/24/, "подсеть попала в конфиг");
-    assert.match(config, /match=sipnet\.ru/, "домен оператора тоже допустим");
-    assert.doesNotMatch(config, /не адрес|999\.999|\/64|\/24\/8/, "мусор отбрасывается: не адрес, октет больше 255, маска больше 32, двойная маска");
-    const directBlock = config.slice(config.indexOf("СИПНЕТ прямой"), config.indexOf("СИПНЕТ регистрация"));
-    assert.doesNotMatch(directBlock, /type=auth|type=registration/, "прямому SIP не нужны пароль и регистрация");
-    assert.match(config, /type=registration/, "обычный транк по-прежнему регистрируется");
-  } finally {
-    delete process.env.DATA_DIR;
-    await rm(dataDirectoryForSip, { recursive: true, force: true });
-  }
+  assert.match(config, /match=212\.53\.40\.1/, "в identify попал канонический зарезервированный IP");
+  assert.doesNotMatch(config, /match=.*\//, "CIDR не попадает в identify");
+  const directBlock = config.slice(config.indexOf("СИПНЕТ прямой"), config.indexOf("СИПНЕТ регистрация"));
+  assert.doesNotMatch(directBlock, /type=auth|type=registration/, "прямому SIP не нужны пароль и регистрация");
+  assert.match(config, /type=registration/, "обычный транк по-прежнему регистрируется");
+  assert.match(directBlock, /set_var=ASCN_TENANT_ID=default/, "PJSIP endpoint закрепляет доверенный tenantId на канале");
+  assert.match(directBlock, /set_var=ASCN_CONNECTION_ID=direct-1/, "PJSIP endpoint закрепляет connectionId на канале");
+});
+
+test("cross-tenant SIP collision откатывает настройки до COMMIT", async () => {
+  const login = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: collisionTenantEmail, password: collisionTenantPassword }),
+  });
+  assert.equal(login.status, 200);
+  const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+  assert.ok(cookie);
+
+  const collision = await fetch(`${baseUrl}/api/voice/settings`, {
+    method: "PUT",
+    headers: { cookie, "content-type": "application/json" },
+    body: JSON.stringify({
+      phoneConnections: [{
+        id: "other-direct",
+        name: "Конфликтующий direct SIP",
+        number: "74951234569",
+        mode: "direct",
+        transport: "udp",
+        allowedAddresses: ["212.53.40.1"],
+      }],
+    }),
+  });
+  assert.equal(collision.status, 400);
+  assert.match((await collision.json()).error, /пересекается с другим подключением/i);
+
+  const settings = await (await fetch(`${baseUrl}/api/voice/settings`, { headers: { cookie } })).json();
+  assert.deepEqual(settings.phoneConnections, [], "невалидная строка не пережила rollback");
 });
 
 test("разбирает ответ помощника по сборке агента", async () => {
@@ -565,7 +813,7 @@ test("пишет разговор в стерео: слева абонент, с
   }
 });
 
-test("каждый пользователь видит только своих агентов, входящий находит владельца по номеру", async () => {
+test("каждый пользователь видит только своих агентов, входящий связан с доверенным SIP endpoint", async () => {
   const json = { "content-type": "application/json" };
   const cookieOf = (response) => (response.headers.get("set-cookie") || "").split(";")[0];
 
@@ -588,6 +836,10 @@ test("каждый пользователь видит только своих �
   await fetch(`${baseUrl}/api/voice/settings`, { method: "PUT", headers: { ...json, cookie: cookieA }, body: JSON.stringify({ xaiApiKey: "test-key-a", phoneConnections: [{ id: "a-phone", name: "Номер A", number: "74959998877", mode: "register", registrar: "sipnet.ru", username: "111", password: "222", transport: "udp", enabled: true }] }) });
   const created = await fetch(`${baseUrl}/api/voice/agents`, { method: "POST", headers: { ...json, cookie: cookieA }, body: JSON.stringify({ name: "Агент арендатора A", instructions: "МАРКЕР-ТЕНАНТА-A. Ты агент.", provider: "xai", model: "grok-voice-think-fast-2.0", variables: [], tools: [], active: true }) });
   assert.equal(created.status, 201);
+  const createdAgent = (await created.json()).agent;
+  const tenantToken = await (await fetch(`${baseUrl}/api/voice/test-token`, { method: "POST", headers: { ...json, cookie: cookieA }, body: JSON.stringify({ agentId: createdAgent.id }) })).json();
+  const tenantA = String(tenantToken.token || "").split(".")[1];
+  assert.match(tenantA, /^[0-9a-f-]{36}$/i);
 
   // B и админ установки не видят агента A
   const listB = await (await fetch(`${baseUrl}/api/voice/agents`, { headers: { cookie: cookieB } })).json();
@@ -601,13 +853,42 @@ test("каждый пользователь видит только своих �
   const anonymous = await fetch(`${baseUrl}/api/voice/agents`);
   assert.equal(anonymous.status, 401);
 
-  // Входящий звонок: шлюз знает только набранный номер — приложение находит тенанта
+  // Поддельный DID не может переключить звонок endpoint владельца установки в A.
+  const spoofed = await fetch(`${baseUrl}/api/voice/runtime`, {
+    method: "POST",
+    headers: { authorization: gatewayAuthorization, ...json },
+    body: JSON.stringify({ action: "session", direction: "inbound", tenantId: "default", connectionId: "a-phone", phone: "+79991234567", did: "74959998877" }),
+  });
+  assert.equal(spoofed.status, 403, "чужой connectionId не ищется по DID в других тенантах");
+
+  const aliasDid = await fetch(`${baseUrl}/api/voice/runtime`, {
+    method: "POST",
+    headers: { authorization: gatewayAuthorization, ...json },
+    body: JSON.stringify({ action: "session", direction: "inbound", tenantId: tenantA, connectionId: "a-phone", phone: "+79991234567", did: "74950000000" }),
+  });
+  assert.equal(aliasDid.status, 200, "endpoint остаётся authority при DID alias оператора");
+
+  const serviceDid = await fetch(`${baseUrl}/api/voice/runtime`, {
+    method: "POST",
+    headers: { authorization: gatewayAuthorization, ...json },
+    body: JSON.stringify({ action: "session", direction: "inbound", tenantId: tenantA, connectionId: "a-phone", phone: "+79991234567", did: "s" }),
+  });
+  assert.equal(serviceDid.status, 200, "endpoint-bound входящий принимает служебный DID s");
+
+  const missingConnection = await fetch(`${baseUrl}/api/voice/runtime`, {
+    method: "POST",
+    headers: { authorization: gatewayAuthorization, ...json },
+    body: JSON.stringify({ action: "session", direction: "inbound", tenantId: tenantA, phone: "+79991234567", did: "74959998877" }),
+  });
+  assert.equal(missingConnection.status, 403, "входящий без connectionId не откатывается к поиску владельца по DID");
+
+  // Доверенные tenant/connection из PJSIP endpoint определяют маршрут; DID — метаданные.
   const session = await fetch(`${baseUrl}/api/voice/runtime`, {
     method: "POST",
-    headers: { authorization: "Bearer test-internal-key", ...json },
-    body: JSON.stringify({ action: "session", phone: "+79991234567", did: "74959998877" }),
+    headers: { authorization: gatewayAuthorization, ...json },
+    body: JSON.stringify({ action: "session", direction: "inbound", tenantId: tenantA, connectionId: "a-phone", phone: "+79991234567", did: "74959998877" }),
   });
-  assert.equal(session.status, 200, "сессия по DID собирается");
+  assert.equal(session.status, 200, "сессия по endpoint и DID собирается");
   const built = await session.json();
   assert.match(built.agent.instructions, /МАРКЕР-ТЕНАНТА-A/, "входящий на номер A получает агента A");
   assert.ok(built.tenantId && built.tenantId !== "default", "тенант в ответе — не default");
@@ -619,12 +900,28 @@ test("каждый пользователь видит только своих �
   assert.equal(afterLogout.status, 401, "старая кука больше не работает");
 });
 
+test("dialplan принимает цифровой, +E.164 и пустой provider DID через один handler", async () => {
+  const dialplan = await readFile(new URL("../asterisk/extensions.conf", import.meta.url), "utf8");
+  assert.match(dialplan, /exten => _X\.,1,Goto\(ascn-inbound-handler,s,1\)/);
+  assert.match(dialplan, /exten => _\+X\.,1,Goto\(ascn-inbound-handler,s,1\)/);
+  assert.match(dialplan, /exten => s,1,Goto\(ascn-inbound-handler,s,1\)/);
+  assert.equal((dialplan.match(/AGI\(agi:\/\/voice-gateway:4573\/register\?tenantId=/g) || []).length, 1, "tenant/connection query собирается только в общем handler");
+});
+
 test("запись начинается после регистрации звонка — файл называется по id карточки", async () => {
   const gateway = await readFile(new URL("../voice-gateway/server.mjs", import.meta.url), "utf8");
-  const register = gateway.indexOf("else await registerCallRecord(meta,");
+  const register = gateway.indexOf("await registerCallRecord(meta,");
+  const realtime = gateway.indexOf("session = await createRealtimeSession({", register);
   const record = gateway.indexOf("recorder = startRecording(");
   assert.ok(register > 0 && record > 0);
-  assert.ok(record > register, "у входящего id карточки появляется только после registerCallRecord — раньше запись писалась под чужим именем и плеер её не находил");
+  assert.ok(realtime > register, "callId создаётся до открытия Realtime — первая реплика уже связана с карточкой звонка");
+  assert.ok(record > realtime, "запись начинается после регистрации карточки звонка");
   assert.match(gateway, /startRecording\(process\.env\.RECORDINGS_DIR, meta\.callId \|\| ""\)/, "имя файла — строго id карточки звонка");
 });
 
+test("gateway передаёт callId для телефонии и сохраняет browser transcripts без него", async () => {
+  const gateway = await readFile(new URL("../voice-gateway/server.mjs", import.meta.url), "utf8");
+  assert.match(gateway, /postTranscript\(phone, "inbound", event\.transcript \|\| "", runtime\.tenantId \|\| "", callMeta\?\.callId \|\| ""\)/);
+  assert.match(gateway, /postTranscript\(phone, "outbound", assistantText, runtime\.tenantId \|\| "", callMeta\?\.callId \|\| ""\)/);
+  assert.match(gateway, /direction: "browser",\s+phone,\s+rate: 24000,/);
+});

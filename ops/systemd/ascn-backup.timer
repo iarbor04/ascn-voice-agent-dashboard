@@ -1,0 +1,12 @@
+[Unit]
+Description=Run ASCN encrypted off-site backup every day
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+RandomizedDelaySec=30m
+Persistent=true
+AccuracySec=1m
+Unit=ascn-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,5 +1,5 @@
-import { createWriteStream, mkdirSync } from "node:fs";
-import { open } from "node:fs/promises";
+import { chmodSync, constants, createWriteStream, mkdirSync, openSync } from "node:fs";
+import { link, open, unlink } from "node:fs/promises";
 import { join } from "node:path";
 
 const RATE = 8000;
@@ -25,15 +25,27 @@ function header(dataBytes) {
 // Пишем стерео: слева абонент, справа агент. Так по записи слышно, кто говорил
 // и где агент перебил — при сведении в моно это теряется.
 export function startRecording(directory, callId) {
-  if (!directory || !/^[0-9a-f-]{36}$/i.test(callId)) return null;
+  if (!directory || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(callId)) return null;
   try {
-    mkdirSync(directory, { recursive: true });
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    // WAV до выгрузки в object storage содержит персональные данные.
+    chmodSync(directory, 0o700);
   } catch {
     return null;
   }
   const path = join(directory, `${callId}.wav`);
-  const stream = createWriteStream(path);
-  stream.on("error", () => undefined);
+  const temporaryPath = `${path}.part`;
+  let descriptor;
+  try {
+    // The final .wav name is published only by close(). A retry worker can
+    // therefore never mistake a file still being written for a completed call.
+    descriptor = openSync(temporaryPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+  } catch {
+    return null;
+  }
+  const stream = createWriteStream(temporaryPath, { fd: descriptor, autoClose: true });
+  let streamError;
+  stream.on("error", (error) => { streamError = error; });
   stream.write(header(0));
   let dataBytes = 0;
 
@@ -51,14 +63,43 @@ export function startRecording(directory, callId) {
       stream.write(out);
     },
     async close() {
-      await new Promise((resolve) => stream.end(resolve));
-      if (!dataBytes) return 0;
+      await new Promise((resolve) => {
+        if (stream.closed) return resolve();
+        stream.once("close", resolve);
+        stream.end();
+      });
+      if (streamError) throw streamError;
+      if (!dataBytes) {
+        await unlink(temporaryPath).catch((error) => {
+          if (error?.code !== "ENOENT") throw error;
+        });
+        return 0;
+      }
       // Размеры известны только в конце, поэтому правим заголовок на месте.
-      const file = await open(path, "r+");
+      const file = await open(temporaryPath, constants.O_RDWR | constants.O_NOFOLLOW);
       try {
         await file.write(header(dataBytes), 0, 44, 0);
+        await file.sync();
       } finally {
         await file.close();
+      }
+      // Hard-link installation has O_EXCL semantics: a stale/final recording
+      // is never overwritten. A crash after link() leaves a complete .wav that
+      // the pre-created sidecar can recover on restart.
+      await link(temporaryPath, path);
+      await unlink(temporaryPath);
+      const folder = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY).catch((error) => {
+        if (["EINVAL", "ENOTSUP", "EPERM"].includes(error?.code)) return null;
+        throw error;
+      });
+      if (folder) {
+        try {
+          await folder.sync().catch((error) => {
+            if (!["EINVAL", "ENOTSUP", "EPERM"].includes(error?.code)) throw error;
+          });
+        } finally {
+          await folder.close();
+        }
       }
       return Math.round(dataBytes / (RATE * CHANNELS * 2) * 10) / 10;
     },

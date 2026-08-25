@@ -13,48 +13,60 @@ https://github.com/iarbor04/ascn-voice-agent-dashboard
   (5060 + RTP 10000–10100). Доступы — у владельца, в репозитории их нет.
 - На сервере живут ЧУЖИЕ проекты (nginx: ascn-funnel, ascn-wa,
   telegram-mailing). Их не трогать. Порт 80/443 занят их nginx.
-- **Docker Hub с сервера отдаёт 429.** Сборка образов — через зеркало:
-  `sed "s|^FROM node:22-alpine|FROM mirror.gcr.io/library/node:22-alpine|" Dockerfile > /tmp/Df && docker build -f /tmp/Df -t ascn-voice-agent-app:latest .`
-  затем `docker compose up -d --force-recreate --no-build app`. Dockerfile в
-  репозитории не менять — зеркало только на сервере.
-- Деплой сейчас ручной: scp изменённых файлов в `/opt/ascn-voice` + сборка по
-  зеркалу. CI нет — хорошая первая задача.
+- Перед первым запуском создайте `.env` командой
+  `node scripts/generate-deployment-env.mjs .env <IP> 3100`.
+  Она печатает только логин и пароль администратора; `.env` остаётся с mode
+  `0600`. Генератор оставляет `TRUST_PROXY=false`; включайте его только после
+  установки nginx-конфига, который перезаписывает оба forwarded-заголовка. Не
+  копируйте `.env.example` как готовый production-конфиг.
+- Compose содержит несколько разных build targets и обязательные one-shot gates
+  (`config-check`, PostgreSQL migration, перенос legacy WAV). Поэтому собирайте и
+  запускайте **весь граф**, а не один `app` image:
+  `docker compose --env-file .env build`, затем
+  `docker compose --env-file .env up -d`.
+- Если Docker Hub ограничивает загрузку, настройте registry mirror в Docker
+  daemon и снова соберите весь Compose-граф. Генерация одного временного
+  Dockerfile и `--no-build app` больше не является рабочим способом деплоя.
+- Деплой ручной, но CI уже проверяет lint, production build, PostgreSQL/Redis
+  integration tests и npm audit.
 
 ## Локальный запуск
 
 - `npm run dev -- -p 3300` + отдельно `node voice-gateway/server.mjs` (8787).
-  `INTERNAL_API_KEY` в `.env.local` (см. `.env.example`).
-- Тесты: `npm test` — сборка + `node --test tests/rendered-html.test.mjs`,
-  23 сценария. Тесты поднимают настоящий прод-сервер на временном каталоге
-  данных, так что гоняются долго, но проверяют живые маршруты.
+  Нужны PostgreSQL, Redis и раздельные ключи из `.env.example`.
+- Тесты: `npm test`; нужны `TEST_DATABASE_URL` и `REDIS_URL`. Тесты поднимают
+  настоящий production server и проверяют живые маршруты, tenant isolation,
+  миграции и redaction секретов.
 - Телефонию локально не проверить: Originate, DTMF и звук требуют Asterisk
   и настоящий SIP-аккаунт. Всё остальное — да.
 
 ## Архитектура: что нужно понять до правок
 
-1. **Мультитенантность.** Регистрация на `/register`, сессии в куке
-   `ascn_session` (scrypt, 30 дней). У каждого пользователя свой каталог
-   `data/tenants/<userId>/` (agents, calls, настройки, ключи). Контекст
-   тенанта — AsyncLocalStorage (`lib/tenant-context.ts`): обращение к
-   хранилищу вне контекста кидает ошибку, это защита от утечки чужих данных.
-   Прежний env-админ (`ADMIN_*`) живёт в тенанте `default` по старым путям —
-   так живая линия владельца пережила миграцию без переноса данных.
+1. **Мультитенантность.** Регистрация на `/register` в production по умолчанию
+   выключена. Пользователи, хэши session-token, агенты, настройки, CRM и звонки
+   хранятся в PostgreSQL с обязательным `tenant_id`. Env-админ (`ADMIN_*`)
+   работает в tenant `default`; plaintext legacy sessions при импорте
+   инвалидируются.
 2. **Черновик и публикация.** Агент правится как черновик, звонки идут по
    снимку `published`. Пустой снимок = агент не публиковался, тогда работает
    черновик. Кнопка «Опубликовать» обязательна, иначе правки не в эфире.
-3. **Шлюз и тенант.** `voice-gateway/server.mjs` таскает `tenantId` через все
-   обратные вызовы в `/api/voice/runtime`. Входящий звонок тенанта не знает —
-   владелец находится по DID (`findTenantByDid`). Токен браузерного теста:
-   `agentId.tenantId.expiresAt.signature` (HMAC на `INTERNAL_API_KEY`).
+3. **Шлюз и тенант.** PJSIP endpoint устанавливает доверенные `tenantId` и
+   `connectionId`; FastAGI переносит их через Redis в AudioSocket и runtime.
+   Runtime повторно проверяет connection внутри tenant; DID/alias — только
+   атрибут уже доверенного endpoint, а не источник владельца. Поиска владельца
+   по DID и fallback в `default` нет. Браузерный HMAC использует отдельный
+   `BROWSER_TOKEN_SECRET`, а токен одноразовый.
 4. **Asterisk-конфиг общий**: собирается агрегатом по всем тенантам
-   (`renderAsteriskAll`), секции чужих тенантов с префиксом `t<id8>-`,
-   у `default` — прежние имена (не ломать: живой транк SIPNET).
+   (`renderAsteriskAll`), имена PJSIP-секций tenant-scoped и collision-checked;
+   у `default` сохранена совместимость с живым транком SIPNET.
 5. **Запись разговоров** — стерео WAV (слева абонент, справа агент), файл
    называется по id карточки звонка и стартует только после её регистрации
    (это чинило баг «записи нет»). Отдаётся через
    `/api/voice/recordings/<id>` только владельцу записи.
-6. **Хранилища** — JSON-файлы с очередью мутаций на тенанта, atomic write
-   (tmp+rename, 0600). БД нет. При росте — первое место для замены.
+6. **Хранилища** — PostgreSQL для пользователей, агентов, настроек, CRM и
+   звонков; Redis для rate limits, admission leases, durable status outbox и
+   одноразовых токенов; MinIO/S3 для tenant-scoped записей. Legacy JSON
+   импортируется idempotent one-shot job; runtime app его не монтирует.
 
 ## Грабли, на которые уже наступали
 
@@ -86,15 +98,12 @@ https://github.com/iarbor04/ascn-voice-agent-dashboard
 
 ## Что делать первым (по важности)
 
-1. **HTTPS.** Панель на голом HTTP, пароли пользователей летят открытым
-   текстом. Нужен поддомен + certbot; конфиг nginx обсуждён с владельцем.
-   После HTTPS включить Secure у сессионной куки.
-2. **Бэкапы** docker-тома `ascn_data` — сейчас их нет вообще.
-3. Сменить дефолтные `INTERNAL_API_KEY` / `ASTERISK_AMI_PASSWORD` в `.env`.
-4. Подтверждение почты и сброс пароля (SMTP-клиент уже есть в `lib/mailer.ts`).
-5. Онбординг нового пользователя: пустой кабинет без своего ключа и номера
+1. Подключить внешний S3/R2 repository для restic и держать успешным
+   еженедельный restore drill (`docs/BACKUP_AND_RESTORE.md`).
+2. Подтверждение почты и сброс пароля (SMTP-клиент уже есть в `lib/mailer.ts`).
+3. Онбординг нового пользователя: пустой кабинет без своего ключа и номера
    не зазвонит — нужен экран «3 шага».
-6. CI/деплой вместо ручного scp.
+4. Автоматизировать деплой после уже добавленного CI.
 
 Секреты (root сервера, пароль панели, ключ xAI, SIP-пароль) передаются
 владельцем лично, не через репозиторий и не через чат.

@@ -1,0 +1,69 @@
+\set ON_ERROR_STOP on
+
+SELECT 'CREATE ROLE ascn_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT'
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ascn_owner')
+\gexec
+
+SELECT format(
+  'CREATE ROLE ascn_migrator LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT PASSWORD %L',
+  :'migrator_password'
+)
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ascn_migrator')
+\gexec
+
+SELECT format(
+  'CREATE ROLE ascn_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT PASSWORD %L',
+  :'runtime_password'
+)
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ascn_app')
+\gexec
+
+SELECT format(
+  'CREATE ROLE ascn_backup LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT PASSWORD %L',
+  :'backup_password'
+)
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ascn_backup')
+\gexec
+
+ALTER ROLE ascn_owner WITH NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+ALTER ROLE ascn_migrator WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT PASSWORD :'migrator_password';
+ALTER ROLE ascn_app WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT PASSWORD :'runtime_password';
+ALTER ROLE ascn_backup WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT PASSWORD :'backup_password';
+GRANT ascn_owner TO ascn_migrator;
+
+SELECT 'CREATE DATABASE ascn_voice OWNER ascn_owner'
+WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'ascn_voice')
+\gexec
+
+ALTER DATABASE ascn_voice OWNER TO ascn_owner;
+REVOKE CREATE ON DATABASE ascn_voice FROM PUBLIC;
+GRANT CONNECT, TEMPORARY ON DATABASE ascn_voice TO ascn_migrator;
+GRANT CONNECT ON DATABASE ascn_voice TO ascn_app;
+GRANT CONNECT ON DATABASE ascn_voice TO ascn_backup;
+
+\connect ascn_voice
+
+ALTER SCHEMA public OWNER TO ascn_owner;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+GRANT USAGE, CREATE ON SCHEMA public TO ascn_migrator;
+GRANT USAGE ON SCHEMA public TO ascn_app;
+GRANT USAGE ON SCHEMA public TO ascn_backup;
+
+-- Existing installations may have tables owned by the former all-purpose role.
+SELECT 'REASSIGN OWNED BY ascn TO ascn_migrator'
+WHERE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ascn')
+\gexec
+
+ALTER DEFAULT PRIVILEGES FOR ROLE ascn_migrator IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO ascn_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE ascn_migrator IN SCHEMA public
+  GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ascn_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE ascn_migrator IN SCHEMA public
+  GRANT SELECT ON TABLES TO ascn_backup;
+ALTER DEFAULT PRIVILEGES FOR ROLE ascn_migrator IN SCHEMA public
+  GRANT SELECT ON SEQUENCES TO ascn_backup;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ascn_app;
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO ascn_app;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO ascn_backup;
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO ascn_backup;
