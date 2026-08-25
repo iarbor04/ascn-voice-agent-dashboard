@@ -1,20 +1,20 @@
-import { canonicalPhone, findTenantByDid, getAsteriskEndpoint, getVoiceSettings, normalizeCallVariables, providerTransport, resolveAgentInstructions, resolveVoiceRoute, type VoiceTool } from "@/lib/voice-agents";
-import { createCallRecord, recordCallMetric, ensurePhoneContact, getCallRecord, getContact, listCallMessages, listMessagesSince, rememberPhoneNote, saveCallTranscript, updateCallRecord, updateContactStatus, updatePhoneContact, type CallStatus } from "@/lib/calls";
+import { canonicalPhone, getAsteriskEndpoint, getVoiceSettings, normalizeCallVariables, providerTransport, resolveAgentInstructions, resolveInboundRoute, resolveOutboundRoute, resolveVoiceRoute, type VoiceTool } from "@/lib/voice-agents";
+import { createCallRecord, recordCallMetric, ensurePhoneContact, getCallRecord, getContact, listCallMessages, listCallTranscript, rememberPhoneNote, saveCallTranscript, transitionCallToTerminal, updateCallRecord, updateContactStatus, updatePhoneContact, type CallStatus } from "@/lib/calls";
 import { analyzeCallTranscript } from "@/lib/call-analysis";
 import { currentTenantId, DEFAULT_TENANT, withTenant } from "@/lib/tenant-context";
 import { searchKnowledge } from "@/lib/knowledge";
 import { sendMail } from "@/lib/mailer";
 
-// Шлюз авторизован общим ключом, поэтому его tenantId мы принимаем на веру.
-// Входящий звонок тенанта не знает — владельца находим по набранному номеру.
-async function gatewayTenant(explicit: unknown, did: string) {
+// Шлюз обязан передать тенант, установленный доверенным PJSIP endpoint.
+// Поиск владельца по управляемому звонящим DID намеренно запрещён.
+function gatewayTenant(explicit: unknown) {
   const claimed = String(explicit || "");
   if (claimed === DEFAULT_TENANT || /^[0-9a-f-]{36}$/i.test(claimed)) return claimed;
-  return (did ? await findTenantByDid(did) : null) || DEFAULT_TENANT;
+  return null;
 }
 
 function authorized(request: Request) {
-  const expected = process.env.INTERNAL_API_KEY?.trim();
+  const expected = process.env.GATEWAY_APP_KEY?.trim();
   return Boolean(expected && request.headers.get("authorization") === `Bearer ${expected}`);
 }
 
@@ -30,8 +30,18 @@ function publicTool(tool: VoiceTool) {
   return tool;
 }
 
-async function buildSession(phone: string, did: string, agentId: string, variables: Record<string, string>) {
-  const { agent, connection, settings } = await resolveVoiceRoute(did, agentId || undefined);
+type SessionDirection = "inbound" | "outbound" | "browser";
+
+async function buildSession(phone: string, did: string, agentId: string, connectionId: string, direction: SessionDirection, variables: Record<string, string>) {
+  const route = direction === "inbound"
+    ? await resolveInboundRoute(connectionId, did)
+    : direction === "outbound"
+      ? await resolveOutboundRoute(agentId || undefined, connectionId || undefined)
+      : await resolveVoiceRoute(undefined, agentId || undefined);
+  const { agent, connection, settings } = route;
+  if ((direction === "inbound" || direction === "outbound") && !connection) {
+    return Response.json({ error: "SIP-подключение не принадлежит тенанту или DID не совпадает" }, { status: 403 });
+  }
   if (!agent) return Response.json({ error: "Нет активного голосового агента" }, { status: 404 });
   if (!agent.active) return Response.json({ error: "Назначенный голосовой агент выключен" }, { status: 409 });
   if (providerTransport(agent.provider) === "yandex" && (!settings.yandexApiKey || !settings.yandexFolderId)) return Response.json({ error: agent.provider === "deepseek" ? "DeepSeek Realtime работает через Yandex AI Studio — подключите ключ и каталог Yandex" : "Yandex AI Studio не подключена" }, { status: 409 });
@@ -59,20 +69,21 @@ async function buildSession(phone: string, did: string, agentId: string, variabl
 }
 
 async function finishCall(callId: string, status: CallStatus, error: string) {
-  const call = await getCallRecord(callId);
+  if (status !== "ended" && status !== "failed") return Response.json({ error: "Некорректный финальный статус" }, { status: 400 });
+  const transition = await transitionCallToTerminal(callId, status, error);
+  const call = transition.call;
   if (!call) return Response.json({ error: "Звонок не найден" }, { status: 404 });
-  const updated = await updateCallRecord(callId, { status, error: error.slice(0, 500) });
-  if (status !== "ended") return Response.json({ call: updated });
-  const messages = await listMessagesSince(`phone:${call.phone.trim() || "unknown"}`, call.createdAt);
+  if (!transition.changed || status !== "ended") return Response.json({ call });
+  const messages = await listCallTranscript(callId);
   const dialogue = messages.map((message) => `${message.direction === "inbound" ? "Собеседник" : "Агент"}: ${message.text}`).join("\n");
   const purpose = call.variables.caller_purpose ? `Цель звонка: ${call.variables.caller_purpose}\n\n` : "";
   const outcome = await analyzeCallTranscript(call.agentId ? (await resolveVoiceRoute(undefined, call.agentId)).agent?.provider || "yandex" : "yandex", `${purpose}Расшифровка:\n${dialogue}`);
-  await notifyByMail(callId, outcome);
   if (outcome) {
     await updateCallRecord(callId, { outcome });
     const note = [outcome.summary, outcome.confirmation && `Подтверждение: ${outcome.confirmation}`, outcome.operator && `Сотрудник: ${outcome.operator}`, outcome.nextStep && `Дальше: ${outcome.nextStep}`].filter(Boolean).join(" · ");
     if (note) await rememberPhoneNote(call.phone, note);
   }
+  await notifyByMail(callId, outcome);
   return Response.json({ call: await getCallRecord(callId) });
 }
 
@@ -110,14 +121,26 @@ async function notifyByMail(callId: string, outcome: Awaited<ReturnType<typeof a
 export async function GET(request: Request) {
   if (!authorized(request)) return new Response("Unauthorized", { status: 401 });
   const url = new URL(request.url);
-  const tenantId = await gatewayTenant(url.searchParams.get("tenantId"), url.searchParams.get("did") || "");
-  return withTenant(tenantId, () => buildSession(canonicalPhone(url.searchParams.get("phone") || "") || "unknown", url.searchParams.get("did")?.slice(0, 60) || "", url.searchParams.get("agentId") || "", {}));
+  const tenantId = gatewayTenant(url.searchParams.get("tenantId"));
+  if (!tenantId) return Response.json({ error: "Шлюз не передал допустимый tenantId" }, { status: 400 });
+  const direction: SessionDirection = url.searchParams.get("direction") === "outbound"
+    ? "outbound"
+    : url.searchParams.get("direction") === "browser" ? "browser" : "inbound";
+  return withTenant(tenantId, () => buildSession(
+    canonicalPhone(url.searchParams.get("phone") || "") || "unknown",
+    url.searchParams.get("did")?.slice(0, 60) || "",
+    url.searchParams.get("agentId") || "",
+    url.searchParams.get("connectionId") || "",
+    direction,
+    {},
+  ));
 }
 
 export async function POST(request: Request) {
   if (!authorized(request)) return new Response("Unauthorized", { status: 401 });
   const body = await request.json().catch(() => null) as Record<string, unknown> | null;
-  const tenantId = await gatewayTenant(body?.tenantId, typeof body?.did === "string" ? body.did : "");
+  const tenantId = gatewayTenant(body?.tenantId);
+  if (!tenantId) return Response.json({ error: "Шлюз не передал допустимый tenantId" }, { status: 400 });
   return withTenant(tenantId, () => handleAction(body, tenantId));
 }
 
@@ -125,12 +148,26 @@ async function handleAction(body: Record<string, unknown> | null, tenantId: stri
   void tenantId;
   const phone = canonicalPhone(typeof body?.phone === "string" ? body.phone : "") || "unknown";
   if (body?.action === "session") {
-    return buildSession(phone, typeof body.did === "string" ? body.did.slice(0, 60) : "", typeof body.agentId === "string" ? body.agentId : "", normalizeCallVariables(body.variables));
+    const direction: SessionDirection = body.direction === "inbound" || body.direction === "outbound" ? body.direction : "browser";
+    return buildSession(
+      phone,
+      typeof body.did === "string" ? body.did.slice(0, 60) : "",
+      typeof body.agentId === "string" ? body.agentId : "",
+      typeof body.connectionId === "string" ? body.connectionId : "",
+      direction,
+      normalizeCallVariables(body.variables),
+    );
   }
   if (body?.action === "call_started") {
     const direction = body.direction === "outbound" ? "outbound" : "inbound";
     const agentId = typeof body.agentId === "string" ? body.agentId : "";
-    const agent = (await resolveVoiceRoute(undefined, agentId || undefined)).agent;
+    const connectionId = typeof body.connectionId === "string" ? body.connectionId : "";
+    const did = typeof body.did === "string" ? body.did.slice(0, 60) : "";
+    const route = direction === "inbound"
+      ? await resolveInboundRoute(connectionId, did)
+      : await resolveOutboundRoute(agentId || undefined, connectionId || undefined);
+    if (!route.connection) return Response.json({ error: "SIP-подключение не принадлежит тенанту или DID не совпадает" }, { status: 403 });
+    const agent = route.agent;
     await ensurePhoneContact(phone);
     const created = await createCallRecord({ id: crypto.randomUUID(), direction, phone, agentId: agent?.id || agentId, agentName: agent?.name || "", provider: agent?.provider || "", model: agent?.model || "", variables: normalizeCallVariables(body.variables) });
     return Response.json({ call: await updateCallRecord(created.id, { status: "live" }) });
@@ -141,7 +178,10 @@ async function handleAction(body: Record<string, unknown> | null, tenantId: stri
     const tool = typeof body.tool === "string" ? body.tool.slice(0, 80) : "";
     const recordedSeconds = Math.max(0, Number(body.recordedSeconds) || 0);
     if (!callId || (!firstAudioMs && !tool && !recordedSeconds)) return Response.json({ error: "Некорректная метрика звонка" }, { status: 400 });
-    return Response.json({ call: await recordCallMetric(callId, { firstAudioMs, tool, recordedSeconds }) });
+    const call = await recordCallMetric(callId, { firstAudioMs, tool, recordedSeconds });
+    return call
+      ? Response.json({ call })
+      : Response.json({ error: "Звонок не найден в заявленном tenant" }, { status: 404 });
   }
   if (body?.action === "call_status") {
     const callId = typeof body.callId === "string" ? body.callId : "";
@@ -154,8 +194,17 @@ async function handleAction(body: Record<string, unknown> | null, tenantId: stri
   if (body?.action === "transcript") {
     const direction = body.direction === "outbound" ? "outbound" : "inbound";
     const text = typeof body.text === "string" ? body.text.trim().slice(0, 10000) : "";
+    const callId = typeof body.callId === "string" && body.callId
+      ? body.callId.toLowerCase()
+      : null;
     if (!text) return Response.json({ error: "Пустая расшифровка" }, { status: 400 });
-    return Response.json({ message: await saveCallTranscript(phone, direction, text) });
+    if (callId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(callId)) {
+      return Response.json({ error: "Некорректный callId" }, { status: 400 });
+    }
+    const message = await saveCallTranscript(phone, direction, text, callId);
+    return message
+      ? Response.json({ message })
+      : Response.json({ error: "Звонок не найден для указанного номера и tenant" }, { status: 404 });
   }
   if (body?.action !== "tool" || typeof body.name !== "string") return Response.json({ error: "Неизвестное действие" }, { status: 400 });
   const args = body.arguments && typeof body.arguments === "object" ? body.arguments as Record<string, unknown> : {};

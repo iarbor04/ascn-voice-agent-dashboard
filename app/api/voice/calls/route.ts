@@ -1,4 +1,4 @@
-import { tenantRoute } from "@/lib/guard";
+import { externalCallRoute } from "@/lib/guard";
 import { currentTenantId } from "@/lib/tenant-context";
 import { createCallRecord, listCallRecords, updateCallRecord } from "@/lib/calls";
 import { canonicalPhone, formatDialNumber, getAsteriskEndpoint, normalizeCallVariables, normalizeDialTarget, providerTransport, resolveOutboundRoute } from "@/lib/voice-agents";
@@ -23,12 +23,14 @@ async function handlePOST(request: Request) {
   if (!connection) return Response.json({ error: "Нет настроенного SIP-номера для исходящих звонков" }, { status: 409 });
   const gatewayUrl = process.env.VOICE_GATEWAY_INTERNAL_URL?.trim();
   if (!gatewayUrl) return Response.json({ error: "VOICE_GATEWAY_INTERNAL_URL не настроен" }, { status: 503 });
+  const gatewayKey = process.env.APP_GATEWAY_KEY?.trim();
+  if (!gatewayKey) return Response.json({ error: "APP_GATEWAY_KEY не настроен" }, { status: 503 });
   const call = await createCallRecord({ id: crypto.randomUUID(), direction: "outbound", phone: canonicalPhone(toNumber), agentId: agent.id, agentName: agent.name, provider: agent.provider, model: agent.model, variables });
   try {
     const response = await fetch(`${gatewayUrl.replace(/\/$/, "")}/calls`, {
       method: "POST",
-      headers: { authorization: `Bearer ${process.env.INTERNAL_API_KEY?.trim() || ""}`, "content-type": "application/json" },
-      body: JSON.stringify({ callId: call.id, tenantId: currentTenantId(), agentId: agent.id, toNumber: formatDialNumber(toNumber, connection.dialFormat) || toNumber, fromNumber: connection.number || connection.username, endpoint: getAsteriskEndpoint(connection), variables, maxCallSeconds: agent.maxCallSeconds }),
+      headers: { authorization: `Bearer ${gatewayKey}`, "content-type": "application/json" },
+      body: JSON.stringify({ callId: call.id, tenantId: currentTenantId(), agentId: agent.id, connectionId: connection.id, toNumber: formatDialNumber(toNumber, connection.dialFormat) || toNumber, fromNumber: connection.number || connection.username, endpoint: getAsteriskEndpoint(connection), variables, maxCallSeconds: agent.maxCallSeconds }),
       signal: AbortSignal.timeout(15000),
     });
     const result = await response.json().catch(() => ({})) as { error?: string };
@@ -40,5 +42,5 @@ async function handlePOST(request: Request) {
   }
 }
 
-export const GET = tenantRoute(handleGET);
-export const POST = tenantRoute(handlePOST);
+export const GET = externalCallRoute(handleGET);
+export const POST = externalCallRoute(handlePOST);

@@ -28,7 +28,7 @@ export default function LoginPage() {
       <div className="brand"><Image className="brand-emblem" src="/emblem.svg" width={36} height={36} alt="ASCN.AI" priority /><span>ASCN.AI Voice</span></div>
       <h1>Вход</h1>
       <p>Голосовые агенты на вашем номере телефона.</p>
-      <label>Почта<input type="email" autoComplete="email" required value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} placeholder="you@example.com" /></label>
+      <label>Логин или почта<input type="text" autoComplete="username" required value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} placeholder="admin или you@example.com" /></label>
       <label>Пароль<input type="password" autoComplete="current-password" required value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} /></label>
       {error && <p className="auth-error">{error}</p>}
       <button className="primary-button" disabled={busy} type="submit">{busy ? "Входим…" : "Войти"}</button>
