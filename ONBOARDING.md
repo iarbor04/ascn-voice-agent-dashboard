@@ -1,15 +1,17 @@
 # ASCN Voice — передача разработчику
 
-Панель голосовых AI-агентов на настоящем телефонном номере: Next.js 16 + свой
-voice-gateway (Node, WebSocket) + Asterisk 20 в Docker. Realtime-провайдеры:
+Панель голосовых AI-агентов на настоящем телефонном номере: Nuxt 4 + Vue 3
+(frontend), Next.js 16 (внутренний backend/API), свой voice-gateway
+(Node, WebSocket) + Asterisk 20 в Docker. Realtime-провайдеры:
 xAI Grok Voice (основной, рабочий ключ у владельца), Yandex Speech Realtime,
 OpenAI Realtime, DeepSeek (живёт поверх Yandex). Репозиторий:
 https://github.com/iarbor04/ascn-voice-agent-dashboard
 
 ## Прод
 
-- Сервер `72.56.117.2`, каталог `/opt/ascn-voice`, docker compose: `app`
-  (панель, порт 3100), `voice-gateway` (8787, только localhost), `asterisk`
+- Сервер `72.56.117.2`, каталог `/opt/ascn-voice`, docker compose: `frontend`
+  (Nuxt-панель, порт 3100), `app` (внутренний API), `voice-gateway` (8787,
+  только localhost), `asterisk`
   (5060 + RTP 10000–10100). Доступы — у владельца, в репозитории их нет.
 - На сервере живут ЧУЖИЕ проекты (nginx: ascn-funnel, ascn-wa,
   telegram-mailing). Их не трогать. Порт 80/443 занят их nginx.
@@ -32,7 +34,9 @@ https://github.com/iarbor04/ascn-voice-agent-dashboard
 
 ## Локальный запуск
 
-- `npm run dev -- -p 3300` + отдельно `node voice-gateway/server.mjs` (8787).
+- Backend: `npm run dev -- -p 3300`; frontend:
+  `NUXT_BACKEND_URL=http://127.0.0.1:3300 npm run frontend:dev`; отдельно
+  `node voice-gateway/server.mjs` (8787).
   Нужны PostgreSQL, Redis и раздельные ключи из `.env.example`.
 - Тесты: `npm test`; нужны `TEST_DATABASE_URL` и `REDIS_URL`. Тесты поднимают
   настоящий production server и проверяют живые маршруты, tenant isolation,

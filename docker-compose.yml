@@ -21,6 +21,8 @@ x-app-environment: &app-environment
   VOICE_GATEWAY_INTERNAL_URL: http://voice-gateway:8787
   TRUST_PROXY: ${TRUST_PROXY:-false}
   ALLOW_PUBLIC_REGISTRATION: ${ALLOW_PUBLIC_REGISTRATION:-false}
+  CAMPAIGN_SCHEDULER_ENABLED: ${CAMPAIGN_SCHEDULER_ENABLED:-true}
+  CAMPAIGN_SCHEDULER_INTERVAL_MS: ${CAMPAIGN_SCHEDULER_INTERVAL_MS:-15000}
   DIRECT_SIP_RESERVATIONS: "${DIRECT_SIP_RESERVATIONS:-{}}"
   OBJECT_STORAGE_ACCESS_KEY_ID: ${OBJECT_STORAGE_APP_ACCESS_KEY_ID:?set OBJECT_STORAGE_APP_ACCESS_KEY_ID}
   OBJECT_STORAGE_SECRET_ACCESS_KEY: ${OBJECT_STORAGE_APP_SECRET_ACCESS_KEY:?set OBJECT_STORAGE_APP_SECRET_ACCESS_KEY}
@@ -247,6 +249,7 @@ services:
     environment:
       <<: *app-environment
       DATABASE_URL: postgresql://ascn_migrator:${POSTGRES_MIGRATOR_PASSWORD:?set POSTGRES_MIGRATOR_PASSWORD}@postgres:5432/ascn_voice
+      CAMPAIGN_SCHEDULER_ENABLED: "false"
     volumes:
       - ascn_data:/app/legacy-data:ro
       - asterisk_config:/app/asterisk-config
@@ -294,8 +297,6 @@ services:
       <<: *app-environment
       DATABASE_URL: postgresql://ascn_app:${POSTGRES_RUNTIME_PASSWORD:?set POSTGRES_RUNTIME_PASSWORD}@postgres:5432/ascn_voice
       DATABASE_SCHEMA_MANAGED: "true"
-    ports:
-      - "${ASCN_BIND_ADDRESS:-127.0.0.1}:${ASCN_HOST_PORT:-3000}:3000"
     volumes:
       - legacy_recordings:/app/legacy-data/recordings:ro
       - asterisk_config:/app/asterisk-config
@@ -328,6 +329,35 @@ services:
       timeout: 5s
       retries: 10
       start_period: 20s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      NUXT_BACKEND_URL: http://app:3000
+      HOST: 0.0.0.0
+      PORT: 3000
+    ports:
+      - "${ASCN_BIND_ADDRESS:-127.0.0.1}:${ASCN_HOST_PORT:-3000}:3000"
+    tmpfs: [/tmp]
+    networks: [application]
+    depends_on:
+      app:
+        condition: service_healthy
+    mem_limit: 512m
+    pids_limit: 150
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
 
   voice-gateway:
     build:

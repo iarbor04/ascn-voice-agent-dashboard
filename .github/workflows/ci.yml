@@ -70,11 +70,20 @@ jobs:
       - name: Install locked dependencies
         run: npm ci
 
+      - name: Install Nuxt frontend dependencies
+        run: npm ci --prefix frontend --legacy-peer-deps
+
       - name: Lint
         run: npm run lint
 
       - name: Build and run integration tests
         run: npm test
 
+      - name: Typecheck and build Nuxt frontend
+        run: npm run frontend:typecheck && npm run frontend:build
+
       - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=high
+
+      - name: Audit Nuxt production dependencies
+        run: npm audit --prefix frontend --omit=dev --audit-level=high

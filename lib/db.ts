@@ -175,6 +175,53 @@ async function migrateSchema(client: PoolClient) {
       ON ascn_call_records (tenant_id, updated_at)
       WHERE status IN ('queued', 'dialing', 'live');
 
+    CREATE TABLE IF NOT EXISTS ascn_call_campaigns (
+      tenant_id text NOT NULL,
+      id text NOT NULL,
+      name text NOT NULL,
+      agent_id text NOT NULL,
+      connection_id text NOT NULL,
+      purpose_template text NOT NULL DEFAULT '',
+      status text NOT NULL CHECK (status IN ('draft', 'running', 'paused', 'completed')),
+      interval_seconds integer NOT NULL CHECK (interval_seconds BETWEEN 60 AND 86400),
+      next_run_at timestamptz,
+      created_at timestamptz NOT NULL,
+      updated_at timestamptz NOT NULL,
+      started_at timestamptz,
+      completed_at timestamptz,
+      PRIMARY KEY (tenant_id, id)
+    );
+    CREATE INDEX IF NOT EXISTS ascn_call_campaigns_due_idx
+      ON ascn_call_campaigns (next_run_at, tenant_id, id)
+      WHERE status = 'running';
+
+    CREATE TABLE IF NOT EXISTS ascn_call_campaign_recipients (
+      tenant_id text NOT NULL,
+      campaign_id text NOT NULL,
+      id text NOT NULL,
+      position integer NOT NULL CHECK (position >= 0),
+      phone text NOT NULL,
+      name text NOT NULL DEFAULT '',
+      variables jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(variables) = 'object'),
+      status text NOT NULL CHECK (status IN ('pending', 'dispatching', 'dialing', 'completed', 'failed', 'skipped')),
+      call_id text,
+      error text NOT NULL DEFAULT '',
+      attempts integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+      created_at timestamptz NOT NULL,
+      updated_at timestamptz NOT NULL,
+      PRIMARY KEY (tenant_id, campaign_id, id),
+      FOREIGN KEY (tenant_id, campaign_id)
+        REFERENCES ascn_call_campaigns(tenant_id, id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS ascn_call_campaign_recipients_position_idx
+      ON ascn_call_campaign_recipients (tenant_id, campaign_id, position);
+    CREATE INDEX IF NOT EXISTS ascn_call_campaign_recipients_pending_idx
+      ON ascn_call_campaign_recipients (tenant_id, campaign_id, position)
+      WHERE status = 'pending';
+    CREATE INDEX IF NOT EXISTS ascn_call_campaign_recipients_call_idx
+      ON ascn_call_campaign_recipients (tenant_id, call_id)
+      WHERE call_id IS NOT NULL;
+
     ALTER TABLE ascn_call_messages
       ADD COLUMN IF NOT EXISTS call_id text;
     CREATE INDEX IF NOT EXISTS ascn_call_messages_call_created_idx
@@ -209,7 +256,7 @@ async function migrateSchema(client: PoolClient) {
     WHERE EXISTS (SELECT 1 FROM newly_applied);
 
     INSERT INTO ascn_schema_migrations (version)
-    VALUES (1), (2), (3), (4)
+    VALUES (1), (2), (3), (4), (6)
     ON CONFLICT (version) DO NOTHING;
   `);
 }
@@ -573,4 +620,11 @@ export async function databaseTransaction<T>(operation: (client: PoolClient) => 
   } finally {
     client.release();
   }
+}
+
+export async function closeDatabasePool() {
+  const pool = databaseGlobals.__ascnPostgresPool;
+  databaseGlobals.__ascnPostgresPool = undefined;
+  databaseGlobals.__ascnPostgresReady = undefined;
+  if (pool) await pool.end();
 }
