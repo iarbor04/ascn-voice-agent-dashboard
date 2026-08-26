@@ -59,6 +59,7 @@ before(async () => {
   }), { encoding: "utf8", mode: 0o600 });
   server = spawn("npm", ["start", "--", "-p", String(port)], {
     stdio: ["ignore", "pipe", "pipe"],
+    detached: process.platform !== "win32",
     env: {
       ...process.env,
       LEGACY_DATA_DIR: dataDirectory,
@@ -87,7 +88,27 @@ before(async () => {
   throw new Error(`Production server did not start:\n${serverOutput}`);
 });
 after(async () => {
-  server?.kill("SIGTERM");
+  if (server?.pid && server.exitCode === null) {
+    const exited = new Promise((resolve) => server.once("exit", resolve));
+    try {
+      if (process.platform === "win32") server.kill("SIGTERM");
+      else process.kill(-server.pid, "SIGTERM");
+    } catch (error) {
+      if (error?.code !== "ESRCH") throw error;
+    }
+    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 5_000))]);
+    if (server.exitCode === null) {
+      try {
+        if (process.platform === "win32") server.kill("SIGKILL");
+        else process.kill(-server.pid, "SIGKILL");
+      } catch (error) {
+        if (error?.code !== "ESRCH") throw error;
+      }
+      await exited;
+    }
+  }
+  server?.stdout?.destroy();
+  server?.stderr?.destroy();
   if (dataDirectory) await rm(dataDirectory, { recursive: true, force: true });
 });
 
