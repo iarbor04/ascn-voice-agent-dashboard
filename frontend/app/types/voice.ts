@@ -114,3 +114,35 @@ export type CallRecord = {
   endedAt: string;
   variables: Record<string, string>;
 };
+
+export type CampaignRecipient = {
+  id: string;
+  position: number;
+  phone: string;
+  name: string;
+  variables: Record<string, string>;
+  status: "pending" | "dispatching" | "dialing" | "completed" | "failed" | "skipped";
+  callId: string | null;
+  callStatus: string | null;
+  error: string;
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CallCampaign = {
+  id: string;
+  name: string;
+  agentId: string;
+  connectionId: string;
+  purposeTemplate: string;
+  status: "draft" | "running" | "paused" | "completed";
+  intervalSeconds: number;
+  nextRunAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  counts: { total: number; pending: number; active: number; completed: number; failed: number };
+  recipients?: CampaignRecipient[];
+};

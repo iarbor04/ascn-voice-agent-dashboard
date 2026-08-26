@@ -84,6 +84,38 @@ button { cursor:pointer; }
 .call-launcher footer { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-top:16px; flex-wrap:wrap; }
 .call-launcher footer small { color:var(--muted); font-size:11px; }
 .call-launcher code { padding:2px 5px; border-radius:5px; background:var(--soft); font-size:11px; }
+.campaign-launcher > header,.campaigns-section > header,.campaign-details > header { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:18px }
+.campaign-launcher > header h2,.campaigns-section > header h2,.campaign-details > header h2 { margin:0; font-size:17px }
+.campaign-launcher > header p,.campaigns-section > header p,.campaign-details > header p { margin:5px 0 0; color:var(--muted); font-size:12px; line-height:1.5 }
+.campaign-interval { display:grid; grid-template-columns:1fr 110px; gap:8px }
+.campaign-file { padding:14px; border:1px dashed #cbd2df; border-radius:12px; background:var(--soft) }
+.campaign-file > span { display:flex; align-items:center; gap:8px; color:var(--ink); font-weight:700 }
+.campaign-file input { background:#fff }
+.campaign-file small { color:var(--muted); line-height:1.5 }
+.campaigns-section { margin:0 0 22px }
+.campaigns-section > header > span { padding:5px 10px; border-radius:20px; color:var(--solar-ink); background:var(--solar-soft); font-size:11px; font-weight:700 }
+.campaign-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(310px,1fr)); gap:12px }
+.campaign-grid > article { padding:16px; border:1px solid var(--line); border-radius:14px; background:#fff; box-shadow:var(--shadow-card) }
+.campaign-grid > article.running { border-color:#c8ead7 }
+.campaign-main { display:flex; align-items:center; gap:9px; width:100%; padding:0; border:0; background:transparent; text-align:left }
+.campaign-main strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:14px }
+.campaign-main small { margin-left:auto; color:var(--muted); white-space:nowrap; font-size:11px }
+.campaign-progress { height:7px; margin:15px 0 10px; overflow:hidden; border-radius:8px; background:var(--soft) }
+.campaign-progress i { display:block; height:100%; border-radius:8px; background:linear-gradient(90deg,var(--accent),#4bcf87); transition:width .3s ease }
+.campaign-counts { display:flex; align-items:center; gap:12px; color:var(--muted); font-size:10px }
+.campaign-counts span:last-child { margin-left:auto; font-weight:700 }
+.campaign-counts b { color:var(--ink); font-size:12px }
+.campaign-grid footer { display:flex; align-items:center; gap:8px; margin-top:14px }
+.campaign-grid footer .icon-button { margin-left:auto }
+.campaign-details { margin:0 0 22px; padding:18px; border:1px solid var(--line); border-radius:16px; background:#fff }
+.campaign-recipient-table { max-height:430px; overflow:auto; border:1px solid var(--line); border-radius:12px }
+.campaign-recipient-head,.campaign-recipient-row { display:grid; grid-template-columns:minmax(180px,1.5fr) minmax(130px,1fr) 110px 70px; gap:12px; align-items:center; padding:10px 12px }
+.campaign-recipient-head { position:sticky; top:0; z-index:1; color:var(--muted); background:var(--soft); font-size:10px; font-weight:700; text-transform:uppercase }
+.campaign-recipient-row { border-top:1px solid var(--line); font-size:12px }
+.campaign-recipient-row > span:first-child { min-width:0 }
+.campaign-recipient-row strong,.campaign-recipient-row small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+.campaign-recipient-row small { margin-top:3px; color:var(--muted); font-size:10px }
+.campaign-recipient-row > p { grid-column:1/-1; margin:0; color:var(--red); font-size:11px }
 .call-records { display:grid; gap:10px; margin-bottom:24px; }
 .call-records article { padding:14px 16px; border:1px solid var(--line); border-radius:14px; background:#fff; }
 .call-records article.failed { border-color:#f4c9cc; }
@@ -606,3 +638,4 @@ button,a { transition:background-color .14s ease, color .14s ease, border-color 
 .voice-lib-pick small { color:var(--muted); font-size:12px }
 .voice-lib-play { width:32px; height:32px; margin-right:6px; flex:0 0 auto; display:grid; place-items:center; border:1px solid var(--line); border-radius:999px; background:#fff; color:var(--ink); font-size:11px }
 .voice-lib-play:hover { background:var(--accent-100) }
+@media(max-width:720px){.campaign-recipient-head{display:none}.campaign-recipient-row{grid-template-columns:1fr auto}.campaign-recipient-row>span:nth-child(2){text-align:right}.campaign-recipient-row>span:nth-child(4){display:none}.campaign-grid{grid-template-columns:1fr}.campaign-counts{flex-wrap:wrap}.campaign-main{flex-wrap:wrap}.campaign-main small{width:100%;margin-left:0}}

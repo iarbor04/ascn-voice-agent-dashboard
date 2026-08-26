@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { scryptSync } from "node:crypto";
 import { createServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -72,6 +73,7 @@ before(async () => {
       ADMIN_PASSWORD: "test-admin-password",
       TRUST_PROXY: "false",
       ALLOW_PUBLIC_REGISTRATION: "true",
+      CAMPAIGN_SCHEDULER_ENABLED: "false",
       DIRECT_SIP_RESERVATIONS: JSON.stringify({
         default: ["212.53.40.1"],
         [collisionTenantId]: ["212.53.40.1"],
@@ -319,6 +321,110 @@ test("guards the outbound call API", async () => {
   });
   assert.equal(badNumber.status, 400);
   assert.match((await badNumber.json()).error, /номер/i);
+});
+
+test("imports a CSV base and schedules outbound campaign calls without duplicates", async () => {
+  const anonymous = await fetch(`${baseUrl}/api/voice/campaigns`);
+  assert.equal(anonymous.status, 401);
+  const agents = (await (await fetch(`${baseUrl}/api/voice/agents`, { headers: { authorization } })).json()).agents;
+  const settings = await (await fetch(`${baseUrl}/api/voice/settings`, { headers: { authorization } })).json();
+  const connection = settings.phoneConnections.find((item) => item.enabled && item.passwordConfigured);
+  const activeAgent = agents.find((item) => item.id === connection?.agentId && item.active);
+  assert.ok(activeAgent && connection, "campaign test needs the configured outbound route");
+
+  const upload = new FormData();
+  upload.set("name", "Подтверждение записей");
+  upload.set("agentId", activeAgent.id);
+  upload.set("connectionId", connection.id);
+  upload.set("purposeTemplate", "Подтвердить запись");
+  upload.set("intervalSeconds", "60");
+  upload.set("file", new File([
+    "phone;name;purpose;order_id\n+79991110001;Иван;;A-101\n+79991110002;Анна;Уточнить время;A-102\n+79991110001;Дубль;;A-103\n+bad-number;Ошибка;;A-104\n",
+  ], "base.csv", { type: "text/csv" }));
+  const createdResponse = await fetch(`${baseUrl}/api/voice/campaigns`, { method: "POST", headers: { authorization }, body: upload });
+  assert.equal(createdResponse.status, 201);
+  const created = await createdResponse.json();
+  assert.deepEqual(created.import, { imported: 2, invalid: 1, duplicates: 1 });
+  assert.equal(created.campaign.status, "draft");
+  assert.equal(created.campaign.counts.total, 2);
+
+  const startedResponse = await fetch(`${baseUrl}/api/voice/campaigns/${created.campaign.id}`, {
+    method: "PATCH", headers: { authorization, "content-type": "application/json" }, body: JSON.stringify({ action: "start" }),
+  });
+  assert.equal(startedResponse.status, 200);
+  const scheduled = await databaseTestQuery(
+    `SELECT campaign.status, campaign.next_run_at <= now() AS due,
+            array_agg(recipient.status ORDER BY recipient.position) AS recipient_statuses
+     FROM ascn_call_campaigns campaign
+     JOIN ascn_call_campaign_recipients recipient
+       ON recipient.tenant_id = campaign.tenant_id AND recipient.campaign_id = campaign.id
+     WHERE campaign.tenant_id = 'default' AND campaign.id = $1
+     GROUP BY campaign.tenant_id, campaign.id`, [created.campaign.id],
+  );
+  assert.deepEqual(scheduled.rows[0], { status: "running", due: true, recipient_statuses: ["pending", "pending"] });
+
+  const received = [];
+  const fakeGateway = createHttpServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => { body += chunk; });
+    request.on("end", () => {
+      received.push(JSON.parse(body));
+      response.writeHead(201, { "content-type": "application/json" });
+      response.end(JSON.stringify({ ok: true }));
+    });
+  });
+  await new Promise((resolve) => fakeGateway.listen(0, "127.0.0.1", resolve));
+  const address = fakeGateway.address();
+  const previousGatewayUrl = process.env.VOICE_GATEWAY_INTERNAL_URL;
+  const previousGatewayKey = process.env.APP_GATEWAY_KEY;
+  process.env.VOICE_GATEWAY_INTERNAL_URL = `http://127.0.0.1:${address.port}`;
+  process.env.APP_GATEWAY_KEY = "test-app-to-gateway-key-20c37b1a";
+  try {
+    const { runCampaignSchedulerSweep } = await import("../lib/campaigns.ts");
+    const { withTenant } = await import("../lib/tenant-context.ts");
+    const firstDispatch = await withTenant("default", () => runCampaignSchedulerSweep());
+    let detail = await (await fetch(`${baseUrl}/api/voice/campaigns/${created.campaign.id}`, { headers: { authorization } })).json();
+    assert.equal(firstDispatch, 1, detail.campaign.recipients[0]?.error || "scheduler did not claim a due recipient");
+    assert.equal(detail.campaign.recipients[0].status, "dialing");
+    assert.equal(detail.campaign.recipients[0].variables.caller_name, "Иван");
+    assert.equal(detail.campaign.recipients[0].variables.caller_purpose, "Подтвердить запись");
+    assert.equal(detail.campaign.recipients[0].variables.order_id, "A-101");
+    assert.equal(received.length, 1);
+    assert.equal(received[0].callId, detail.campaign.recipients[0].callId, "campaign reserves a stable call id before gateway dispatch");
+
+    await databaseTestQuery(
+      `UPDATE ascn_call_records SET status = 'ended', ended_at = now(), updated_at = now()
+       WHERE tenant_id = 'default' AND id = $1`, [detail.campaign.recipients[0].callId],
+    );
+    await databaseTestQuery(
+      `UPDATE ascn_call_campaigns SET next_run_at = now()
+       WHERE tenant_id = 'default' AND id = $1`, [created.campaign.id],
+    );
+    assert.equal(await withTenant("default", () => runCampaignSchedulerSweep()), 1);
+    detail = await (await fetch(`${baseUrl}/api/voice/campaigns/${created.campaign.id}`, { headers: { authorization } })).json();
+    assert.equal(detail.campaign.recipients[0].status, "completed");
+    assert.equal(detail.campaign.recipients[1].status, "dialing");
+    assert.equal(received.length, 2, "every unique CSV phone is dispatched exactly once");
+    assert.equal(received[1].callId, detail.campaign.recipients[1].callId);
+
+    await databaseTestQuery(
+      `UPDATE ascn_call_campaign_recipients
+       SET status = 'dispatching', updated_at = now() - interval '10 minutes'
+       WHERE tenant_id = 'default' AND campaign_id = $1 AND id = $2`,
+      [created.campaign.id, detail.campaign.recipients[1].id],
+    );
+    assert.equal(await withTenant("default", () => runCampaignSchedulerSweep()), 0, "an accepted call survives a scheduler restart without redialing");
+    detail = await (await fetch(`${baseUrl}/api/voice/campaigns/${created.campaign.id}`, { headers: { authorization } })).json();
+    assert.equal(detail.campaign.recipients[1].status, "dialing");
+    assert.equal(received.length, 2);
+  } finally {
+    if (previousGatewayUrl === undefined) delete process.env.VOICE_GATEWAY_INTERNAL_URL; else process.env.VOICE_GATEWAY_INTERNAL_URL = previousGatewayUrl;
+    if (previousGatewayKey === undefined) delete process.env.APP_GATEWAY_KEY; else process.env.APP_GATEWAY_KEY = previousGatewayKey;
+    fakeGateway.closeAllConnections();
+    await new Promise((resolve) => fakeGateway.close(resolve));
+    const { closeDatabasePool } = await import("../lib/db.ts");
+    await closeDatabasePool();
+  }
 });
 
 test("treats DeepSeek as its own provider but keeps the Yandex transport", async () => {
