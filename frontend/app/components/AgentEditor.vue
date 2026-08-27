@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ArrowLeft, AudioLines, BookOpen, Bot, Code2, Plug, Plus, Save, ShieldAlert, Sparkles, Trash2, Upload, Wrench, X } from "@lucide/vue";
 import type { Agent, CallRecord, PhoneConnection, Provider, Tool, VoiceSettings } from "~/types/voice";
-import { builtins, models, newPhoneConnection, providerLabels, timezones, uid, voices } from "~/utils/voice";
+import { builtins, models, newPhoneConnection, providerLabels, timezones, toolNotes, uid, voices } from "~/utils/voice";
 
 const props = defineProps<{ agent: Agent; settings: VoiceSettings; saving: boolean }>();
 const emit = defineEmits<{
@@ -27,11 +27,13 @@ watch(() => props.agent, (next) => { draft.value = structuredClone(toRaw(next));
 
 const providerModels = computed(() => models.filter((model) => model.provider === draft.value.provider));
 const availableTools = computed(() => builtins.filter(([name]) => !draft.value.tools.some((tool) => tool.type === "ascn" && tool.name === name)));
+const mcpCount = computed(() => draft.value.tools.filter((tool) => tool.type === "mcp").length);
 const connectedNumbers = computed(() => props.settings.phoneConnections.filter((item) => item.agentId === draft.value.id));
 
 // MCP исполняет сам провайдер речи. Принимают его только xAI и OpenAI Realtime;
 // у Yandex и DeepSeek исполнителя нет, поэтому там инструмент недоступен —
 // и об этом надо сказать вслух, а не выбрасывать его молча.
+const TOOL_LIMIT = 16;
 const mcpSupported = computed(() => draft.value.provider === "xai" || draft.value.provider === "openai");
 
 function changeProvider(provider: Provider) {
@@ -49,7 +51,7 @@ function changeProvider(provider: Provider) {
 }
 
 function addTool(type: "ascn" | "dtmf" | "mcp", name?: string) {
-  if (draft.value.tools.length >= 8) return notify("Можно подключить не больше восьми инструментов");
+  if (draft.value.tools.length >= TOOL_LIMIT) return notify(`Можно подключить не больше ${TOOL_LIMIT} инструментов`);
   if (type === "mcp") {
     draft.value.tools.push({ id: uid(), type, label: "mcp_server", url: "", authorization: "", allowedTools: [] });
     return;
@@ -166,7 +168,7 @@ onMounted(loadAgentData);
         <section class="prompt-section guardrails"><div class="voice-section-title"><span><ShieldAlert :size="16" /> Запреты</span></div><textarea v-model="draft.guardrails" rows="4" placeholder="Не обещать скидки и сроки без подтверждения"></textarea></section>
         <section class="prompt-section knowledge"><div class="voice-section-title"><span><BookOpen :size="16" /> База знаний <i>{{ draft.knowledge.length }}/20</i></span><button class="improve-button" @click="knowledgeInput?.click()"><Upload :size="14" /> Загрузить файлы</button></div><input ref="knowledgeInput" class="sr-only" type="file" multiple accept=".txt,.md,.csv,.json,.yaml,.yml,text/plain" @change="addKnowledge"><ul v-if="draft.knowledge.length" class="knowledge-list"><li v-for="file in draft.knowledge" :key="file.id"><strong>{{ file.name }}</strong><small>{{ file.text.length }} знаков</small><button class="icon-button" @click="draft.knowledge = draft.knowledge.filter((item) => item.id !== file.id)"><Trash2 :size="15" /></button></li></ul><p v-else class="knowledge-empty">Текстовые файлы с каталогом, правилами или ответами на вопросы.</p></section>
         <section class="setting-block"><div class="setting-row"><div><strong>Агент говорит первым</strong><p>Открывает разговор заданной фразой.</p></div><label class="switch"><input v-model="draft.speaksFirst" type="checkbox"><span></span></label></div><textarea v-if="draft.speaksFirst" v-model="draft.firstMessage" class="soft-textarea" rows="2" placeholder="Здравствуйте! Чем могу помочь?"></textarea><div class="setting-row filled"><div><strong>Собеседник может перебивать</strong></div><label class="switch"><input v-model="draft.allowInterruptions" type="checkbox"><span></span></label></div><div class="setting-row"><div><strong>Агент знает номер звонящего</strong></div><label class="switch"><input v-model="draft.shareCallerNumber" type="checkbox"><span></span></label></div></section>
-        <section class="tools-section"><div class="voice-section-title"><span><Wrench :size="16" /> Инструменты <i>{{ draft.tools.length }}/8</i></span></div><div class="tool-list">
+        <section class="tools-section"><div class="voice-section-title"><span><Wrench :size="16" /> Инструменты <i>{{ draft.tools.length }}/{{ TOOL_LIMIT }}</i></span></div><div class="tool-list">
             <article v-for="tool in draft.tools" :key="tool.id" class="tool-row">
               <header><span><Wrench :size="15" /> {{ toolLabel(tool) }}</span><button @click="draft.tools = draft.tools.filter((item) => item.id !== tool.id)"><Trash2 :size="15" /></button></header>
               <div v-if="tool.type === 'mcp'" class="tool-fields">
@@ -178,11 +180,27 @@ onMounted(loadAgentData);
               </div>
             </article>
           </div>
+          <div class="tool-catalog-title">Можно добавить</div>
           <div class="tool-catalog">
-            <div v-for="entry in availableTools" :key="entry[0]" class="tool-offer"><i><Wrench :size="16" /></i><div><strong>{{ entry[1] }}</strong></div><button class="pill-button" @click="addTool('ascn', entry[0])">Добавить</button></div>
-            <div v-if="!draft.tools.some((tool) => tool.type === 'dtmf')" class="tool-offer"><i><Wrench :size="16" /></i><div><strong>Тональный набор (IVR)</strong></div><button class="pill-button" @click="addTool('dtmf')">Добавить</button></div>
-            <div v-if="mcpSupported" class="tool-offer"><i><Plug :size="16" /></i><div><strong>Внешний MCP-сервер</strong><p>Подключает чужие инструменты по адресу</p></div><button class="pill-button" @click="addTool('mcp')">Добавить</button></div>
-            <div v-else class="tool-offer _muted"><i><Plug :size="16" /></i><div><strong>Внешний MCP-сервер</strong><p>Доступен на xAI и OpenAI — {{ providerLabels[draft.provider] }} его не исполняет</p></div></div>
+            <div v-for="entry in availableTools" :key="entry[0]" class="tool-offer">
+              <i><Wrench :size="16" /></i>
+              <div><strong>{{ entry[1] }}</strong><p>{{ toolNotes[entry[0]] }}</p></div>
+              <button class="pill-button" @click="addTool('ascn', entry[0])">Добавить</button>
+            </div>
+            <div v-if="!draft.tools.some((tool) => tool.type === 'dtmf')" class="tool-offer">
+              <i><Wrench :size="16" /></i>
+              <div><strong>Тональный набор (IVR)</strong><p>{{ toolNotes.dtmf }}</p></div>
+              <button class="pill-button" @click="addTool('dtmf')">Добавить</button>
+            </div>
+            <div v-if="mcpSupported" class="tool-offer">
+              <i><Plug :size="16" /></i>
+              <div><strong>{{ mcpCount ? "Ещё MCP-сервер" : "Внешний MCP-сервер" }}</strong><p>{{ toolNotes.mcp }}</p></div>
+              <button class="pill-button" @click="addTool('mcp')">Добавить</button>
+            </div>
+            <div v-else class="tool-offer _muted">
+              <i><Plug :size="16" /></i>
+              <div><strong>Внешний MCP-сервер</strong><p>Доступен на xAI и OpenAI — {{ providerLabels[draft.provider] }} его не исполняет</p></div>
+            </div>
           </div></section>
       </template>
 

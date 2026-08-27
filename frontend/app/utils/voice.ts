@@ -32,6 +32,19 @@ export const builtins = [
   ["search_knowledge", "Поиск по базе знаний"],
 ] as const;
 
+// Подписи в каталоге: без них карточка не объясняет, зачем инструмент нужен.
+export const toolNotes: Record<string, string> = {
+  contact_context: "Читает карточку и историю звонков",
+  update_contact: "Сохраняет имя и язык клиента",
+  move_pipeline: "Переводит клиента на этап воронки",
+  remember_note: "Запоминает факт до следующего звонка",
+  transfer_call: "Передаёт разговор живому оператору",
+  end_call: "Кладёт трубку, когда задача закрыта",
+  search_knowledge: "Ищет ответ в базе знаний агента",
+  dtmf: "Проходит IVR по цифрам",
+  mcp: "Чужие инструменты по адресу",
+};
+
 export const timezones = ["Europe/Kaliningrad", "Europe/Moscow", "Europe/Samara", "Asia/Yekaterinburg", "Asia/Omsk", "Asia/Krasnoyarsk", "Asia/Irkutsk", "Asia/Vladivostok", "Asia/Almaty", "Europe/Minsk", "UTC"];
 
 export const templates = {

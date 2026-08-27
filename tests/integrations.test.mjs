@@ -310,3 +310,15 @@ test("подписанная ссылка на запись пропускает
   const guarded = await readFile(new URL("../app/api/voice/recordings/[id]/route.ts", import.meta.url), "utf8");
   assert.match(guarded, /export const GET = tenantRoute\(handleGET\)/);
 });
+
+test("лимит инструментов одинаков на фронтенде и в backend", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const { TOOL_LIMIT } = await import("../lib/voice-agents.ts");
+  const editor = await readFile(new URL("../frontend/app/components/AgentEditor.vue", import.meta.url), "utf8");
+  const frontendLimit = Number(editor.match(/const TOOL_LIMIT = (\d+)/)[1]);
+
+  // Разойдутся — панель разрешит добавить лишние инструменты, а backend их
+  // молча срежет при сохранении, и агент потеряет их без объяснения.
+  assert.equal(frontendLimit, TOOL_LIMIT, "лимиты обязаны совпадать");
+  assert.ok(TOOL_LIMIT > 7, "семь встроенных инструментов не должны занимать весь лимит");
+});

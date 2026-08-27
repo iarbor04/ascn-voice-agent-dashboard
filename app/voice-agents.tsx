@@ -743,7 +743,7 @@ function AgentEditor({ agent, setAgent, settings, saving, onSave, onPublish, onA
     });
   }
   function addTool(key: string) {
-    if (agent.tools.length >= 8) return notify("Можно подключить не больше восьми инструментов");
+    if (agent.tools.length >= 16) return notify("Можно подключить не больше 16 инструментов");
     const [type, name] = key.split(":");
     if (type === "ascn" && agent.tools.some((tool) => tool.type === "ascn" && tool.name === name)) return notify("Этот инструмент уже добавлен");
     let tool: Tool;

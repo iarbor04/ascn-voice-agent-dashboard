@@ -26,6 +26,10 @@ export function providerTransport(provider: AiProvider) {
   if (provider === "xai") return "xai";
   return "yandex";
 }
+// Семь встроенных инструментов занимают почти весь прежний лимит из восьми:
+// на внешние MCP-серверы места не оставалось.
+export const TOOL_LIMIT = 16;
+
 export const ambientSounds = ["none", "office", "cafe", "street"] as const;
 export type AmbientSound = (typeof ambientSounds)[number];
 export type RealtimeModel = (typeof realtimeModelCatalog)[number]["id"];
@@ -294,7 +298,7 @@ function normalizeAgent(value: unknown, existing?: VoiceAgent): VoiceAgent {
   const tools = (Array.isArray(source.tools) ? source.tools : []).map((item) => {
     const raw = item && typeof item === "object" ? item as Record<string, unknown> : {};
     return normalizeTool(item, previousTools.get(String(raw.id)));
-  }).filter((item): item is VoiceTool => Boolean(item)).slice(0, 8);
+  }).filter((item): item is VoiceTool => Boolean(item)).slice(0, TOOL_LIMIT);
   const now = new Date().toISOString();
   return {
     id: existing?.id || cleanId(source.id),
