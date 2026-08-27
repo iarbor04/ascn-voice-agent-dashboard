@@ -276,3 +276,26 @@ Node test runner, файлы `tests/*.test.mjs` — как уже принято
 | amoCRM `unsorted/sip`: `metadata` с `phone`, `called_at`, `duration`, `link`, `service_code`, `is_call_event_needed`, только для входящих | [amocrm.ru, unsorted-api](https://www.amocrm.ru/developers/content/crm_platform/unsorted-api) |
 | OpenAI Realtime принимает MCP: `type: "mcp"`, `server_label`, `server_url`, `authorization`, `headers`, `allowed_tools`, `require_approval` | [developers.openai.com, realtime-mcp](https://developers.openai.com/api/docs/guides/realtime-mcp) |
 | xAI принимает MCP в realtime-сессии | живая проверка 24 августа 2026, отражена в `voice-gateway/server.mjs:43` |
+
+## Что уточнилось при реализации
+
+Дизайн выдержан, кроме четырёх мест — все в сторону меньшего риска.
+
+1. **Шов для транспорта.** Адаптеры вызывают `transport.call` из
+   `lib/integrations/transport.ts`, а не `callPublicApi` напрямую. Причина
+   ровно одна: SSRF-защита по делу не пускает запросы на localhost, поэтому
+   поднять тестовый сервер и сходить в него настоящим клиентом невозможно.
+   Шов подменяется только в тестах.
+2. **Повтор вручную идёт одной попыткой.** Автоматическая выгрузка делает три
+   попытки с паузами 5 и 30 секунд, а кнопка «Отправить снова» — одну: висеть
+   тридцать пять секунд с крутилкой хуже, чем нажать второй раз.
+3. **Отдача записи вынесена в `lib/recording-stream.ts`.** Публичный роут не
+   мог обойтись без работы с MinIO, range-запросами и legacy-каталогом,
+   которую PR #1 уже написал, а дублировать 130 строк нельзя.
+4. **`allowedTools` вместо `requireApproval` в типе инструмента.** Поле
+   подтверждения удалено из модели, а не просто скрыто в интерфейсе: хранить
+   значение, которое обязано быть постоянным, незачем.
+
+Логотипы Bitrix24, amoCRM и Google Таблиц — буквенные знаки в фирменных
+цветах, а не официальные файлы: подделывать чужой знак нельзя. Заменяются
+файлом с тем же именем в `frontend/public/logos/`.
