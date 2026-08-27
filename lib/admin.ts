@@ -15,3 +15,10 @@ export function verifyAdmin(headers: Headers) {
   const decoded = Buffer.from(authorization.slice(6), "base64").toString("utf8");
   return equal(decoded, `${username}:${password}`);
 }
+
+export function verifyAdminCredentials(rawUsername: unknown, rawPassword: unknown) {
+  const password = process.env.ADMIN_PASSWORD;
+  if (!password) return false;
+  const username = process.env.ADMIN_USERNAME || "admin";
+  return equal(`${String(rawUsername || "").trim()}:${String(rawPassword || "")}`, `${username}:${password}`);
+}

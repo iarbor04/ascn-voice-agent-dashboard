@@ -1,6 +1,8 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
-import { readdir } from "node:fs/promises";
+import type { PoolClient, QueryResultRow } from "pg";
+import { databaseQuery, databaseTransaction } from "./db.ts";
 import { currentTenantId, DEFAULT_TENANT } from "./tenant-context.ts";
 
 export const realtimeModelCatalog = [
@@ -134,24 +136,18 @@ export type SafeVoiceTool = Omit<Extract<VoiceTool, { type: "mcp" }>, "authoriza
   | Omit<Extract<VoiceTool, { type: "function" }>, "authorization"> & { authorizationConfigured?: boolean }
   | Exclude<VoiceTool, { type: "mcp" | "function" }>;
 
-export type SafeVoiceAgent = Omit<VoiceAgent, "tools"> & { tools: SafeVoiceTool[]; live: boolean; unpublished: boolean };
+export type SafePublishedAgent = Omit<PublishedAgent, "tools"> & { tools: SafeVoiceTool[] };
+export type SafeVoiceAgent = Omit<VoiceAgent, "tools" | "published"> & {
+  tools: SafeVoiceTool[];
+  published: SafePublishedAgent | null;
+  live: boolean;
+  unpublished: boolean;
+};
 
-const rootDirectory = process.env.DATA_DIR?.trim() || path.join(process.cwd(), ".data");
-// Тенант default живёт по прежним путям: работающая установка ничего не мигрирует.
-// Остальные тенанты — по каталогу на пользователя.
-function tenantDirectory(tenantId: string) {
-  if (tenantId === DEFAULT_TENANT) return rootDirectory;
-  if (!/^[0-9a-f-]{36}$/i.test(tenantId)) throw new Error("Некорректный идентификатор тенанта");
-  return path.join(rootDirectory, "tenants", tenantId);
-}
-function voicePathFor(tenantId: string) { return path.join(tenantDirectory(tenantId), "voice-agents.json"); }
+const legacyDirectory = process.env.LEGACY_DATA_DIR?.trim() || process.env.DATA_DIR?.trim() || path.join(process.cwd(), ".data");
 // Конфиг Asterisk общий на все тенанты: телефония одна.
-const asteriskDirectory = path.join(rootDirectory, "asterisk");
+const asteriskDirectory = process.env.ASTERISK_CONFIG_DIR?.trim() || path.join(legacyDirectory, "asterisk");
 const asteriskProviderPath = path.join(asteriskDirectory, "pjsip-provider.conf");
-
-// Очередь изменений — своя на тенанта, иначе записи разных людей толкались бы.
-const queues = new Map<string, Promise<unknown>>();
-function queueFor(tenantId: string) { return queues.get(tenantId) || Promise.resolve(); }
 
 const defaultSettings: VoiceConnectionSettings = {
   yandexFolderId: "",
@@ -168,7 +164,22 @@ const defaultSettings: VoiceConnectionSettings = {
   phoneConnections: [],
 };
 
-type VoiceStore = { agents: VoiceAgent[]; settings: VoiceConnectionSettings };
+interface VoiceSettingsRow extends QueryResultRow {
+  tenant_id: string;
+  settings: unknown;
+}
+
+interface VoiceAgentRow extends QueryResultRow {
+  tenant_id: string;
+  id: string;
+  agent: unknown;
+}
+
+type VoiceAgentGlobals = typeof globalThis & {
+  __ascnAsteriskConfigurationReady?: Promise<void>;
+};
+
+const voiceAgentGlobals = globalThis as VoiceAgentGlobals;
 
 function cleanText(value: unknown, max: number) {
   return typeof value === "string" ? value.trim().slice(0, max) : "";
@@ -303,15 +314,86 @@ function normalizeAgent(value: unknown, existing?: VoiceAgent): VoiceAgent {
   };
 }
 
-// Октеты проверяем по значению, а не по числу цифр: 999.999.999.999 подходит
-// под «три цифры через точку», но Asterisk на таком адресе не стартует.
-function isMatchableAddress(value: string) {
-  const [address, prefix, ...extra] = value.split("/");
-  if (extra.length) return false;
-  if (prefix !== undefined && !(/^[0-9]{1,2}$/.test(prefix) && Number(prefix) <= 32)) return false;
-  const octets = address.split(".");
-  if (octets.length === 4 && octets.every((part) => /^[0-9]{1,3}$/.test(part) && Number(part) <= 255)) return true;
-  return prefix === undefined && /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(address) && /[a-z]/i.test(address);
+// Direct SIP is a tenant identity boundary. Hostnames can rebind and broad
+// CIDRs let the first tenant claim another carrier, so only one canonical,
+// globally-routable IPv4 address (/32) is accepted.
+function exactPublicIpv4(value: unknown) {
+  const raw = typeof value === "string" ? value.trim() : "";
+  const [address, prefix, ...extra] = raw.split("/");
+  if (!raw || extra.length || (prefix !== undefined && prefix !== "32")) return "";
+  const parts = address.split(".");
+  if (parts.length !== 4 || parts.some((part) => !/^(?:0|[1-9][0-9]{0,2})$/.test(part) || Number(part) > 255)) return "";
+  const [a, b, c] = parts.map(Number);
+  const reserved = a === 0
+    || a === 10
+    || a === 127
+    || (a === 100 && b >= 64 && b <= 127)
+    || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && b === 0 && c === 0)
+    || (a === 192 && b === 0 && c === 2)
+    || (a === 192 && b === 88 && c === 99)
+    || (a === 192 && b === 168)
+    || (a === 198 && (b === 18 || b === 19))
+    || (a === 198 && b === 51 && c === 100)
+    || (a === 203 && b === 0 && c === 113)
+    || a >= 224;
+  return reserved ? "" : parts.map(Number).join(".");
+}
+
+function directSipReservations() {
+  const raw = process.env.DIRECT_SIP_RESERVATIONS?.trim();
+  if (!raw) return new Map<string, Set<string>>();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("DIRECT_SIP_RESERVATIONS должен быть JSON-объектом tenantId -> [public IP]");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("DIRECT_SIP_RESERVATIONS должен быть JSON-объектом tenantId -> [public IP]");
+  }
+  const reservations = new Map<string, Set<string>>();
+  for (const [rawTenantId, rawAddresses] of Object.entries(parsed as Record<string, unknown>)) {
+    const tenantId = rawTenantId === DEFAULT_TENANT ? DEFAULT_TENANT : rawTenantId.toLowerCase();
+    if (tenantId !== DEFAULT_TENANT && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(tenantId)) {
+      throw new Error(`DIRECT_SIP_RESERVATIONS содержит недопустимый tenantId: ${rawTenantId}`);
+    }
+    if (!Array.isArray(rawAddresses) || reservations.has(tenantId)) {
+      throw new Error(`DIRECT_SIP_RESERVATIONS содержит недопустимую резервацию для ${rawTenantId}`);
+    }
+    const addresses = new Set<string>();
+    for (const value of rawAddresses) {
+      const address = exactPublicIpv4(value);
+      if (!address) throw new Error(`DIRECT_SIP_RESERVATIONS содержит недопустимый public IPv4 для ${rawTenantId}`);
+      addresses.add(address);
+    }
+    reservations.set(tenantId, addresses);
+  }
+  return reservations;
+}
+
+function validateDirectSipBindings(settings: VoiceConnectionSettings, tenantId: string) {
+  const direct = settings.phoneConnections.filter((connection) => connection.enabled && connection.mode === "direct");
+  if (!direct.length) return;
+  const reserved = directSipReservations().get(tenantId.toLowerCase());
+  if (!reserved?.size) throw new Error(`Direct SIP для tenant ${tenantId} не зарезервирован администратором`);
+  for (const connection of direct) {
+    if (!connection.allowedAddresses.length) throw new Error(`Direct SIP «${connection.name}» требует точный public IPv4`);
+    for (const value of connection.allowedAddresses) {
+      const address = exactPublicIpv4(value);
+      if (!address || !reserved.has(address)) {
+        throw new Error(`Direct SIP IP ${value} не зарезервирован для tenant ${tenantId}`);
+      }
+    }
+  }
+}
+
+function ipv4Range(value: string) {
+  const address = exactPublicIpv4(value);
+  if (!address) return null;
+  const numeric = address.split(".").map(Number).reduce((result, octet) => result * 256 + octet, 0);
+  return { first: numeric, last: numeric };
 }
 
 function normalizePhoneConnection(value: unknown, existing?: PhoneConnection): PhoneConnection {
@@ -333,11 +415,11 @@ function normalizePhoneConnection(value: unknown, existing?: PhoneConnection): P
     transport: source.transport === "tcp" ? "tcp" : "udp",
     operatorExtension: safe("operatorExtension", 100),
     mode: source.mode === "direct" ? "direct" : "register",
-    // Прямой SIP пускает звонки по адресу отправителя, поэтому список должен
-    // содержать только корректные адреса или подсети — иначе Asterisk не поднимется.
-    allowedAddresses: (Array.isArray(source.allowedAddresses) ? source.allowedAddresses : [])
-      .map((item) => String(item || "").trim())
-      .filter(isMatchableAddress)
+    // Stored canonically; authorization against the administrator reservation
+    // is enforced both on settings save and every global Asterisk render.
+    allowedAddresses: [...new Set((Array.isArray(source.allowedAddresses) ? source.allowedAddresses : [])
+      .map(exactPublicIpv4)
+      .filter(Boolean))]
       .slice(0, 20),
   };
 }
@@ -351,8 +433,17 @@ function normalizeSettings(value: unknown, existing: VoiceConnectionSettings) {
   const previousConnections = new Map(existing.phoneConnections.map((connection) => [connection.id, connection]));
   const phoneConnections = (Array.isArray(source.phoneConnections) ? source.phoneConnections : []).slice(0, 30).map((item) => {
     const raw = item && typeof item === "object" ? item as Record<string, unknown> : {};
+    if (raw.mode === "direct" && raw.enabled !== false) {
+      const supplied = Array.isArray(raw.allowedAddresses) ? raw.allowedAddresses : [];
+      if (supplied.some((address) => !exactPublicIpv4(address))) {
+        throw new Error("Direct SIP разрешает только точные public IPv4 (без DNS или сетей шире /32)");
+      }
+    }
     return normalizePhoneConnection(item, previousConnections.get(String(raw.id)));
   });
+  if (new Set(phoneConnections.map((connection) => connection.id)).size !== phoneConnections.length) {
+    throw new Error("Идентификаторы SIP-подключений не должны повторяться");
+  }
   return {
     yandexFolderId: safe("yandexFolderId", 100),
     yandexApiKey: cleanSecret(source.yandexApiKey) || existing.yandexApiKey,
@@ -427,83 +518,159 @@ function migrateAgent(value: Partial<VoiceAgent>): VoiceAgent {
   } as VoiceAgent;
 }
 
-async function readStore(tenantId = currentTenantId()): Promise<VoiceStore> {
+async function readSettings(tenantId = currentTenantId()): Promise<VoiceConnectionSettings> {
+  const result = await databaseQuery<VoiceSettingsRow>(
+    "SELECT tenant_id, settings FROM ascn_voice_settings WHERE tenant_id = $1 LIMIT 1",
+    [tenantId],
+  );
+  return result.rows[0] ? migrateSettings(result.rows[0].settings) : { ...defaultSettings, phoneConnections: [] };
+}
+
+async function lockedSettings(client: PoolClient, tenantId: string) {
+  await client.query(
+    `INSERT INTO ascn_voice_settings (tenant_id, settings, updated_at)
+     VALUES ($1, $2::jsonb, now())
+     ON CONFLICT (tenant_id) DO NOTHING`,
+    [tenantId, JSON.stringify(defaultSettings)],
+  );
+  const result = await client.query<VoiceSettingsRow>(
+    `SELECT tenant_id, settings
+     FROM ascn_voice_settings
+     WHERE tenant_id = $1
+     FOR UPDATE`,
+    [tenantId],
+  );
+  if (!result.rows[0]) throw new Error("Не удалось заблокировать настройки тенанта");
+  return migrateSettings(result.rows[0].settings);
+}
+
+function agentFromValue(value: unknown) {
+  return migrateAgent((value && typeof value === "object" && !Array.isArray(value) ? value : {}) as Partial<VoiceAgent>);
+}
+
+async function lockedAgent(client: PoolClient, tenantId: string, id: string) {
+  const result = await client.query<VoiceAgentRow>(
+    `SELECT tenant_id, id, agent
+     FROM ascn_voice_agents
+     WHERE tenant_id = $1 AND id = $2
+     FOR UPDATE`,
+    [tenantId, id],
+  );
+  return result.rows[0] ? agentFromValue(result.rows[0].agent) : null;
+}
+
+async function persistAgent(client: PoolClient, tenantId: string, agent: VoiceAgent, existing: boolean) {
+  if (existing) {
+    await client.query(
+      `UPDATE ascn_voice_agents
+       SET agent = $3::jsonb, updated_at = now()
+       WHERE tenant_id = $1 AND id = $2`,
+      [tenantId, agent.id, JSON.stringify(agent)],
+    );
+    return;
+  }
   try {
-    const parsed = JSON.parse(await readFile(voicePathFor(tenantId), "utf8")) as Partial<VoiceStore>;
-    const agents = (Array.isArray(parsed.agents) ? parsed.agents : []).map(migrateAgent);
-    return { agents, settings: migrateSettings(parsed.settings) };
+    await client.query(
+      `INSERT INTO ascn_voice_agents (tenant_id, id, agent, updated_at)
+       VALUES ($1, $2, $3::jsonb, now())`,
+      [tenantId, agent.id, JSON.stringify(agent)],
+    );
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    return { agents: [], settings: { ...defaultSettings } };
+    if ((error as { code?: string }).code === "23505") throw new Error("Агент с таким id уже существует");
+    throw error;
   }
 }
 
-async function writeStore(store: VoiceStore) {
-  const tenantId = currentTenantId();
-  await mkdir(tenantDirectory(tenantId), { recursive: true });
-  const target = voicePathFor(tenantId);
-  const temporaryPath = `${target}.tmp`;
-  await writeFile(temporaryPath, JSON.stringify(store, null, 2), { encoding: "utf8", mode: 0o600 });
-  await rename(temporaryPath, target);
-}
-
-function mutate<T>(operation: (store: VoiceStore) => T | Promise<T>) {
-  const tenantId = currentTenantId();
-  const run = queueFor(tenantId).catch(() => undefined).then(async () => {
-    const store = await readStore(tenantId);
-    const result = await operation(store);
-    await writeStore(store);
-    return result;
+function safeTools(tools: VoiceTool[]): SafeVoiceTool[] {
+  return tools.map((tool) => {
+    if (tool.type === "mcp") {
+      return { id: tool.id, type: tool.type, label: tool.label, url: tool.url, requireApproval: tool.requireApproval, authorizationConfigured: Boolean(tool.authorization) };
+    }
+    if (tool.type === "function") {
+      return { id: tool.id, type: tool.type, name: tool.name, description: tool.description, parameters: tool.parameters, webhookUrl: tool.webhookUrl, authorizationConfigured: Boolean(tool.authorization) };
+    }
+    return tool;
   });
-  queues.set(tenantId, run.then(() => undefined, () => undefined));
-  return run;
 }
 
 export function toSafeAgent(agent: VoiceAgent): SafeVoiceAgent {
   return {
     ...agent,
+    published: agent.published ? { ...agent.published, tools: safeTools(agent.published.tools) } : null,
     live: Boolean(agent.published),
     unpublished: hasUnpublishedChanges(agent),
-    tools: agent.tools.map((tool) => {
-      if (tool.type === "mcp") {
-        return { id: tool.id, type: tool.type, label: tool.label, url: tool.url, requireApproval: tool.requireApproval, authorizationConfigured: Boolean(tool.authorization) };
-      }
-      if (tool.type === "function") {
-        return { id: tool.id, type: tool.type, name: tool.name, description: tool.description, parameters: tool.parameters, webhookUrl: tool.webhookUrl, authorizationConfigured: Boolean(tool.authorization) };
-      }
-      return tool;
-    }),
+    tools: safeTools(agent.tools),
   };
 }
 
 export async function listVoiceAgents() {
-  await queueFor(currentTenantId());
-  return (await readStore()).agents.map(toSafeAgent);
+  const tenantId = currentTenantId();
+  const result = await databaseQuery<VoiceAgentRow>(
+    `SELECT tenant_id, id, agent
+     FROM ascn_voice_agents
+     WHERE tenant_id = $1
+     ORDER BY COALESCE(agent ->> 'createdAt', ''), id`,
+    [tenantId],
+  );
+  return result.rows.map((row) => toSafeAgent(agentFromValue(row.agent)));
 }
 
 export async function getVoiceAgent(id?: string) {
-  await queueFor(currentTenantId());
-  const agents = (await readStore()).agents;
-  return (id ? agents.find((agent) => agent.id === id) : agents.find((agent) => agent.active)) || null;
+  const tenantId = currentTenantId();
+  const result = id
+    ? await databaseQuery<VoiceAgentRow>(
+      `SELECT tenant_id, id, agent
+       FROM ascn_voice_agents
+       WHERE tenant_id = $1 AND id = $2
+       LIMIT 1`,
+      [tenantId, id],
+    )
+    : await databaseQuery<VoiceAgentRow>(
+      `SELECT tenant_id, id, agent
+       FROM ascn_voice_agents
+       WHERE tenant_id = $1 AND agent ->> 'active' IS DISTINCT FROM 'false'
+       ORDER BY COALESCE(agent ->> 'createdAt', ''), id
+       LIMIT 1`,
+      [tenantId],
+    );
+  return result.rows[0] ? agentFromValue(result.rows[0].agent) : null;
 }
 
 export function saveVoiceAgent(value: unknown, id?: string) {
-  return mutate((store) => {
-    const existing = id ? store.agents.find((agent) => agent.id === id) : undefined;
+  const tenantId = currentTenantId();
+  return databaseTransaction(async (client) => {
+    const existing = id ? await lockedAgent(client, tenantId, id) : null;
     if (id && !existing) throw new Error("Голосовой агент не найден");
-    const agent = normalizeAgent(value, existing);
-    if (existing) Object.assign(existing, agent);
-    else store.agents.push(agent);
+    const agent = normalizeAgent(value, existing || undefined);
+    await persistAgent(client, tenantId, agent, Boolean(existing));
     return toSafeAgent(agent);
   });
 }
 
 export function deleteVoiceAgent(id: string) {
-  return mutate((store) => {
-    const index = store.agents.findIndex((agent) => agent.id === id);
-    if (index < 0) return false;
-    const [removed] = store.agents.splice(index, 1);
-    store.settings.phoneConnections.forEach((connection) => { if (connection.agentId === removed.id) connection.agentId = ""; });
+  const tenantId = currentTenantId();
+  return databaseTransaction(async (client) => {
+    const removed = await client.query(
+      "DELETE FROM ascn_voice_agents WHERE tenant_id = $1 AND id = $2 RETURNING id",
+      [tenantId, id],
+    );
+    if (!removed.rowCount) return false;
+    const settings = await lockedSettings(client, tenantId);
+    let settingsChanged = false;
+    settings.phoneConnections.forEach((connection) => {
+      if (connection.agentId === id) {
+        connection.agentId = "";
+        settingsChanged = true;
+      }
+    });
+    if (settingsChanged) {
+      await client.query(
+        `UPDATE ascn_voice_settings
+         SET settings = $2::jsonb, updated_at = now()
+         WHERE tenant_id = $1`,
+        [tenantId, JSON.stringify(settings)],
+      );
+    }
     return true;
   });
 }
@@ -511,81 +678,146 @@ export function deleteVoiceAgent(id: string) {
 export function getVoiceSettings(safe: false): Promise<VoiceConnectionSettings>;
 export function getVoiceSettings(safe?: true): Promise<SafeVoiceSettings>;
 export async function getVoiceSettings(safe = true) {
-  await queueFor(currentTenantId());
-  const settings = (await readStore()).settings;
+  const settings = await readSettings();
   if (!safe) return settings;
   return getVoiceSettingsFromValue(settings);
 }
 
 function endpointId(connection: PhoneConnection, tenantId = currentTenantId()) {
   const base = `ascn-${connection.id.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 48)}`;
-  return tenantId === DEFAULT_TENANT ? base : `t${tenantId.replace(/[^a-z0-9]/gi, "").slice(0, 8)}-${base}`;
+  if (tenantId === DEFAULT_TENANT) return base;
+  const tenantSegment = createHash("sha256").update(tenantId).digest("hex").slice(0, 32);
+  return `t${tenantSegment}-${base}`;
 }
 
 function renderAsteriskProviders(settings: VoiceConnectionSettings, tenantId = currentTenantId()) {
+  validateDirectSipBindings(settings, tenantId);
   const ready = settings.phoneConnections.filter((item) => item.enabled && (item.mode === "direct" ? item.allowedAddresses.length > 0 : item.registrar && item.username && item.password));
   if (!ready.length) return "; SIP-транки не настроены в ASCN\n";
   return ready.map((connection) => {
     const section = endpointId(connection, tenantId);
     const transport = connection.transport === "tcp" ? "transport-tcp" : "transport-udp";
     const proxy = connection.proxy ? `outbound_proxy=sip:${connection.proxy}\\;lr\n` : "";
-    const match = connection.registrar.replace(/^sips?:\/\//i, "").split(":")[0];
     const fromUser = connection.fromUser === "login" ? connection.username : connection.number || connection.username;
     // Прямой SIP: оператор сам звонит на наш адрес, регистрация и пароль не нужны.
     // Звонок опознаётся по адресу отправителя через identify.
     if (connection.mode === "direct") {
-      return `; ${connection.name} · ${connection.number} · прямой SIP\n[${section}-endpoint]\ntype=endpoint\ntransport=${transport}\ncontext=from-provider\ndisallow=all\nallow=alaw,ulaw\ndirect_media=no\nrtp_symmetric=yes\nforce_rport=yes\nrewrite_contact=yes\nfrom_user=${fromUser}\nfrom_domain=${connection.registrar.replace(/^sips?:\/\//i, "").split(":")[0] || "ascn"}\n\n[${section}-identify]\ntype=identify\nendpoint=${section}-endpoint\n${connection.allowedAddresses.map((address) => `match=${address}`).join("\n")}\n`;
+      return `; ${connection.name} · ${connection.number} · прямой SIP\n[${section}-endpoint]\ntype=endpoint\ntransport=${transport}\ncontext=from-provider\ndisallow=all\nallow=alaw,ulaw\ndirect_media=no\nrtp_symmetric=yes\nforce_rport=yes\nrewrite_contact=yes\nset_var=ASCN_TENANT_ID=${tenantId}\nset_var=ASCN_CONNECTION_ID=${connection.id}\nfrom_user=${fromUser}\nfrom_domain=${connection.registrar.replace(/^sips?:\/\//i, "").split(":")[0] || "ascn"}\n\n[${section}-identify]\ntype=identify\nendpoint=${section}-endpoint\n${connection.allowedAddresses.map((address) => `match=${address}`).join("\n")}\n`;
     }
-    return `; ${connection.name} · ${connection.number}\n[${section}-auth]\ntype=auth\nauth_type=userpass\nusername=${connection.username}\npassword=${connection.password}\n\n[${section}-aor]\ntype=aor\ncontact=sip:${connection.registrar}\nqualify_frequency=60\n\n[${section}-endpoint]\ntype=endpoint\ntransport=${transport}\ncontext=from-provider\ndisallow=all\nallow=alaw,ulaw\ndirect_media=no\nrtp_symmetric=yes\nforce_rport=yes\nrewrite_contact=yes\noutbound_auth=${section}-auth\naors=${section}-aor\nfrom_user=${fromUser}\nfrom_domain=${connection.registrar}\n${proxy}\n[${section}-registration]\ntype=registration\ntransport=${transport}\noutbound_auth=${section}-auth\nserver_uri=sip:${connection.registrar}\nclient_uri=sip:${connection.username}@${connection.registrar}\ncontact_user=${connection.number || connection.username}\nretry_interval=60\nforbidden_retry_interval=300\nexpiration=300\n${proxy}\n[${section}-identify]\ntype=identify\nendpoint=${section}-endpoint\nmatch=${match}\n`;
+    return `; ${connection.name} · ${connection.number}\n[${section}-auth]\ntype=auth\nauth_type=userpass\nusername=${connection.username}\npassword=${connection.password}\n\n[${section}-aor]\ntype=aor\ncontact=sip:${connection.registrar}\nqualify_frequency=60\n\n[${section}-endpoint]\ntype=endpoint\ntransport=${transport}\ncontext=from-provider\ndisallow=all\nallow=alaw,ulaw\ndirect_media=no\nrtp_symmetric=yes\nforce_rport=yes\nrewrite_contact=yes\nset_var=ASCN_TENANT_ID=${tenantId}\nset_var=ASCN_CONNECTION_ID=${connection.id}\noutbound_auth=${section}-auth\naors=${section}-aor\nfrom_user=${fromUser}\nfrom_domain=${connection.registrar}\n${proxy}\n[${section}-registration]\ntype=registration\ntransport=${transport}\noutbound_auth=${section}-auth\nserver_uri=sip:${connection.registrar}\nclient_uri=sip:${connection.username}@${connection.registrar}\ncontact_user=${connection.number || connection.username}\n; line связывает входящий INVITE именно с этой регистрацией/endpoint,\n; даже если разные тенанты используют один IP SIP-оператора.\nline=yes\nendpoint=${section}-endpoint\nretry_interval=60\nforbidden_retry_interval=300\nexpiration=300\n${proxy}`;
   }).join("\n");
 }
 
 export async function listTenantIds() {
-  const ids = [DEFAULT_TENANT];
-  try {
-    for (const entry of await readdir(path.join(rootDirectory, "tenants"))) {
-      if (/^[0-9a-f-]{36}$/i.test(entry)) ids.push(entry);
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  return ids;
+  const result = await databaseQuery<{ tenant_id: string }>(
+    `SELECT tenant_id FROM ascn_voice_settings
+     UNION
+     SELECT tenant_id FROM ascn_voice_agents
+     ORDER BY tenant_id`,
+  );
+  const ids = result.rows
+    .map((row) => row.tenant_id)
+    .filter((tenantId) => tenantId === DEFAULT_TENANT || /^[0-9a-f-]{36}$/i.test(tenantId));
+  return ids.includes(DEFAULT_TENANT) ? ids : [DEFAULT_TENANT, ...ids];
 }
 
-// Телефония одна на всех: конфиг Asterisk собирается из транков каждого тенанта.
-// Настройки текущего тенанта приходят из памяти: на диске они ещё старые,
-// запись случится после этого рендера.
-async function renderAsteriskAll(current: { tenantId: string; settings: VoiceConnectionSettings }) {
+// Телефония одна на всех: конфиг Asterisk собирается из согласованного снимка
+// PostgreSQL. Глобальный advisory lock в saveVoiceSettings сериализует рендер
+// между всеми экземплярами приложения.
+async function renderAsteriskAll(client: PoolClient) {
+  const result = await client.query<VoiceSettingsRow>(
+    "SELECT tenant_id, settings FROM ascn_voice_settings ORDER BY tenant_id",
+  );
   const parts: string[] = [];
-  for (const tenantId of await listTenantIds()) {
-    const settings = tenantId === current.tenantId
-      ? current.settings
-      : (await readStore(tenantId).catch(() => null))?.settings;
-    if (settings?.phoneConnections.length) parts.push(renderAsteriskProviders(settings, tenantId));
+  const directMatches: Array<{ tenantId: string; connectionId: string; address: string; range: ReturnType<typeof ipv4Range> }> = [];
+  const renderedSections = new Set<string>();
+  for (const row of result.rows) {
+    if (row.tenant_id !== DEFAULT_TENANT && !/^[0-9a-f-]{36}$/i.test(row.tenant_id)) continue;
+    const settings = migrateSettings(row.settings);
+    for (const connection of settings.phoneConnections) {
+      const section = endpointId(connection, row.tenant_id);
+      if (renderedSections.has(section)) throw new Error("Обнаружен конфликт имён SIP endpoint");
+      renderedSections.add(section);
+    }
+    for (const connection of settings.phoneConnections.filter((item) => item.enabled && item.mode === "direct")) {
+      for (const address of connection.allowedAddresses) {
+        const range = ipv4Range(address);
+        const collision = directMatches.find((existing) => {
+          if (range && existing.range) return range.first <= existing.range.last && existing.range.first <= range.last;
+          return !range && !existing.range && address === existing.address;
+        });
+        if (collision && (collision.tenantId !== row.tenant_id || collision.connectionId !== connection.id)) {
+          throw new Error(`SIP-адрес ${address} пересекается с другим подключением; endpoint нельзя определить однозначно`);
+        }
+        directMatches.push({ tenantId: row.tenant_id, connectionId: connection.id, address, range });
+      }
+    }
+    if (settings.phoneConnections.length) parts.push(renderAsteriskProviders(settings, row.tenant_id));
   }
   return parts.join("\n") || "; SIP-транки не настроены в ASCN\n";
 }
 
-// Входящий приходит без тенанта — находим владельца номера по DID.
-export async function findTenantByDid(did: string) {
-  const wanted = normalizeDialedNumber(did || "");
-  if (!wanted) return null;
-  for (const tenantId of await listTenantIds()) {
-    const store = await readStore(tenantId).catch(() => null);
-    if (store?.settings.phoneConnections.some((item) => item.enabled && normalizeDialedNumber(item.number) === wanted)) return tenantId;
+async function writeAsteriskConfiguration(client: PoolClient) {
+  await mkdir(asteriskDirectory, { recursive: true, mode: 0o700 });
+  const rendered = await renderAsteriskAll(client);
+  const current = await readFile(asteriskProviderPath, "utf8").catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  });
+  if (current === rendered) return;
+  const temporaryPath = `${asteriskProviderPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryPath, rendered, { encoding: "utf8", mode: 0o600 });
+    await rename(temporaryPath, asteriskProviderPath);
+  } finally {
+    await unlink(temporaryPath).catch(() => undefined);
   }
-  return null;
 }
 
-export function saveVoiceSettings(value: unknown) {
-  return mutate(async (store) => {
-    store.settings = normalizeSettings(value, store.settings);
-    await mkdir(asteriskDirectory, { recursive: true });
-    const temporaryPath = `${asteriskProviderPath}.tmp`;
-    await writeFile(temporaryPath, await renderAsteriskAll({ tenantId: currentTenantId(), settings: store.settings }), { encoding: "utf8", mode: 0o600 });
-    await rename(temporaryPath, asteriskProviderPath);
-    return getVoiceSettingsFromValue(store.settings);
+// Health/startup reconciliation guarantees that Asterisk sees a config rendered
+// from the imported PostgreSQL state before gateway/Asterisk containers start.
+async function reconcileAsteriskConfiguration() {
+  await databaseTransaction(async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock($1, $2)", [401013, 3]);
+    await writeAsteriskConfiguration(client);
   });
+}
+
+export function ensureAsteriskConfiguration() {
+  if (!voiceAgentGlobals.__ascnAsteriskConfigurationReady) {
+    const running = reconcileAsteriskConfiguration();
+    voiceAgentGlobals.__ascnAsteriskConfigurationReady = running;
+    void running.finally(() => {
+      if (voiceAgentGlobals.__ascnAsteriskConfigurationReady === running) {
+        voiceAgentGlobals.__ascnAsteriskConfigurationReady = undefined;
+      }
+    }).catch(() => undefined);
+  }
+  return voiceAgentGlobals.__ascnAsteriskConfigurationReady;
+}
+
+export async function saveVoiceSettings(value: unknown) {
+  const tenantId = currentTenantId();
+  const settings = await databaseTransaction(async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock($1, $2)", [401013, 3]);
+    const existing = await lockedSettings(client, tenantId);
+    const updated = normalizeSettings(value, existing);
+    validateDirectSipBindings(updated, tenantId);
+    await client.query(
+      `UPDATE ascn_voice_settings
+       SET settings = $2::jsonb, updated_at = now()
+      WHERE tenant_id = $1`,
+      [tenantId, JSON.stringify(updated)],
+    );
+    // Validate the complete, transaction-visible tenant snapshot before the
+    // row can commit. The actual file stays post-commit so Asterisk never sees
+    // uncommitted state, but a cross-tenant endpoint/IP collision cannot leave
+    // PostgreSQL poisoned when rendering fails.
+    await renderAsteriskAll(client);
+    return getVoiceSettingsFromValue(updated);
+  });
+  await reconcileAsteriskConfiguration();
+  return settings;
 }
 
 function getVoiceSettingsFromValue(settings: VoiceConnectionSettings) {
@@ -627,33 +859,52 @@ export function hasUnpublishedChanges(agent: VoiceAgent) {
 }
 
 export function publishVoiceAgent(id: string) {
-  return mutate((store) => {
-    const agent = store.agents.find((item) => item.id === id);
+  const tenantId = currentTenantId();
+  return databaseTransaction(async (client) => {
+    const agent = await lockedAgent(client, tenantId, id);
     if (!agent) return null;
     agent.published = draftSnapshot(agent);
     agent.publishedAt = new Date().toISOString();
+    await persistAgent(client, tenantId, agent, true);
     return { ...agent };
   });
 }
 
 export function unpublishVoiceAgent(id: string) {
-  return mutate((store) => {
-    const agent = store.agents.find((item) => item.id === id);
+  const tenantId = currentTenantId();
+  return databaseTransaction(async (client) => {
+    const agent = await lockedAgent(client, tenantId, id);
     if (!agent) return null;
     agent.published = null;
     agent.publishedAt = "";
+    await persistAgent(client, tenantId, agent, true);
     return { ...agent };
   });
 }
 
 export async function resolveVoiceRoute(did?: string, requestedAgentId?: string) {
-  await queueFor(currentTenantId());
-  const store = await readStore();
+  const settings = await readSettings();
   const normalizedDid = normalizeDialedNumber(did || "");
-  const connection = normalizedDid ? store.settings.phoneConnections.find((item) => item.enabled && normalizeDialedNumber(item.number) === normalizedDid) : undefined;
+  const connection = normalizedDid ? settings.phoneConnections.find((item) => item.enabled && normalizeDialedNumber(item.number) === normalizedDid) : undefined;
   const agentId = requestedAgentId || connection?.agentId;
-  const found = (agentId ? store.agents.find((item) => item.id === agentId) : store.agents.find((item) => item.active)) || null;
-  return { agent: found ? liveAgent(found) : null, draft: found, connection: connection || null, settings: store.settings };
+  const found = await getVoiceAgent(agentId || undefined);
+  return { agent: found ? liveAgent(found) : null, draft: found, connection: connection || null, settings };
+}
+
+// Идентичность входящей линии уже установлена Asterisk по PJSIP endpoint.
+// Здесь мы повторно связываем endpoint с подключением внутри заявленного
+// тенанта. DID у операторов часто пустой, `s`, alias или номер в другом
+// формате; он остаётся метаданными, но не переопределяет уже доказанную
+// endpoint -> tenant -> connection идентичность.
+export async function resolveInboundRoute(connectionId: string, did: string) {
+  const settings = await readSettings();
+  const connection = settings.phoneConnections.find((item) => item.enabled && item.id === connectionId) || null;
+  void did;
+  if (!connection) {
+    return { agent: null, draft: null, connection: null, settings };
+  }
+  const found = await getVoiceAgent(connection.agentId || undefined);
+  return { agent: found ? liveAgent(found) : null, draft: found, connection, settings };
 }
 
 export function canonicalPhone(value: string) {
@@ -680,13 +931,12 @@ export function normalizeDialTarget(value: string) {
 }
 
 export async function resolveOutboundRoute(agentId?: string, connectionId?: string) {
-  await queueFor(currentTenantId());
-  const store = await readStore();
-  const found = (agentId ? store.agents.find((item) => item.id === agentId) : store.agents.find((item) => item.active)) || null;
+  const settings = await readSettings();
+  const found = await getVoiceAgent(agentId || undefined);
   const agent = found ? liveAgent(found) : null;
-  const ready = store.settings.phoneConnections.filter((item) => item.enabled && item.registrar && item.username && item.password);
+  const ready = settings.phoneConnections.filter((item) => item.enabled && item.registrar && item.username && item.password);
   const connection = (connectionId ? ready.find((item) => item.id === connectionId) : ready.find((item) => item.agentId === agent?.id) || ready[0]) || null;
-  return { agent, draft: found, connection, settings: store.settings };
+  return { agent, draft: found, connection, settings };
 }
 
 export function getAsteriskEndpoint(connection: PhoneConnection | null) {

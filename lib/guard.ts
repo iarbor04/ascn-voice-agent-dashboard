@@ -19,14 +19,9 @@ export async function resolvePrincipal(request: Request): Promise<Principal | nu
     // У каждого пользователя свой тенант: id пользователя и есть id тенанта.
     if (user) return { tenantId: user.id, email: user.email, kind: "session" };
   }
-  // Машинный ключ шлюза и автоматизаций принадлежит владельцу установки.
-  const internal = process.env.INTERNAL_API_KEY?.trim();
-  if (internal && request.headers.get("authorization") === `Bearer ${internal}`) {
-    return { tenantId: DEFAULT_TENANT, email: "internal", kind: "admin" };
-  }
   // Прежний админ из переменных окружения живёт в тенанте default —
   // существующая установка продолжает работать без миграции.
-  if (!process.env.ADMIN_PASSWORD || verifyAdmin(request.headers)) {
+  if (verifyAdmin(request.headers)) {
     return { tenantId: DEFAULT_TENANT, email: process.env.ADMIN_USERNAME || "admin", kind: "admin" };
   }
   return null;
@@ -39,5 +34,20 @@ export function tenantRoute<C>(handler: Handler<C>): Handler<C> {
     const principal = await resolvePrincipal(request);
     if (!principal) return Response.json({ error: "Нужен вход" }, { status: 401 });
     return withTenant(principal.tenantId, () => handler(request, context));
+  };
+}
+
+// Отдельный ключ автоматизаций имеет ровно одну область: API звонков
+// владельца установки. Он не является principal и не открывает остальные
+// tenantRoute-маршруты.
+export function externalCallRoute<C>(handler: Handler<C>): Handler<C> {
+  return async (request, context) => {
+    const principal = await resolvePrincipal(request);
+    if (principal) return withTenant(principal.tenantId, () => handler(request, context));
+    const expected = process.env.EXTERNAL_CALL_API_KEY?.trim();
+    if (!expected || request.headers.get("authorization") !== `Bearer ${expected}`) {
+      return Response.json({ error: "Нужен вход" }, { status: 401 });
+    }
+    return withTenant(DEFAULT_TENANT, () => handler(request, context));
   };
 }

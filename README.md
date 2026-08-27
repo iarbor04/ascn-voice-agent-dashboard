@@ -60,7 +60,7 @@ SIP-оператор
 Asterisk (регистрация SIP и RTP)
         ↓  AudioSocket PCM 8 kHz
 ASCN Voice Gateway
-        ├─ выбор агента по DID
+        ├─ PJSIP endpoint → connection → tenant; DID только перепроверяется
         ├─ ASCN CRM-память и инструменты
         ├─ Yandex Realtime
         └─ OpenAI Realtime (PCM 24 kHz, ресемплинг в шлюзе)
@@ -82,10 +82,19 @@ Yandex AI Studio и OpenAI API не выдают обычный телефонн
 ## Первый запуск
 
 ```bash
+node scripts/generate-deployment-env.mjs .env IP-СЕРВЕРА 3000
+# Команда создаёт .env mode 0600 и один раз печатает пароль администратора.
 docker compose up -d --build
 ```
 
-Откройте `http://IP-СЕРВЕРА:3000`:
+Compose намеренно не содержит секретов по умолчанию и не стартует с короткими
+или совпадающими internal keys. PostgreSQL, Redis и MinIO используют разные
+runtime-учётные записи; root/superuser credentials приложению не передаются.
+
+По умолчанию панель слушает только `127.0.0.1`. Сначала настройте HTTPS reverse
+proxy, который **перезаписывает** `X-Forwarded-For` и `X-Forwarded-Proto`, затем
+явно включите `TRUST_PROXY=true`. Для локальной проверки используйте SSH tunnel.
+Откройте HTTPS-адрес панели:
 
 1. Создайте голосового агента и выберите Yandex или OpenAI.
 2. В разделе «Подключение и номера» сохраните ключ соответствующего AI-провайдера.
@@ -96,7 +105,10 @@ docker compose up -d --build
 
 Для Yandex сервисному аккаунту нужна роль `ai.models.user` и scope `yc.ai.foundationModels.execute`. Для OpenAI создайте API key и, если ключ ограничен проектом, укажите Project ID. Для xAI создайте ключ в [console.x.ai](https://console.x.ai/home) и дайте ему доступ к эндпоинту voice.
 
-Ключи и пароли сохраняются в Docker volume `ascn_data` с правами `0600` и не возвращаются в браузер.
+Агенты, настройки, контакты, сессии и звонки хранятся в PostgreSQL; записи — в
+tenant-scoped object storage. Legacy volume доступен только одноразовым migration
+jobs; runtime-приложение его не монтирует. После успешной миграции persistent
+markers делают последующие старты дешёвыми. Секретные поля не возвращаются в браузер.
 
 ## Исходящие звонки
 
@@ -104,7 +116,7 @@ docker compose up -d --build
 
 ```bash
 curl -s -X POST http://IP-СЕРВЕРА:3000/api/voice/calls \
-  -H "authorization: Bearer $INTERNAL_API_KEY" \
+  -H "authorization: Bearer $EXTERNAL_CALL_API_KEY" \
   -H "content-type: application/json" \
   -d '{"toNumber":"+79001234567","variables":{"caller_name":"Клиника на Ленина","caller_purpose":"Перенести приём с четверга на пятницу после 17:00 и узнать номер записи"}}'
 ```
@@ -113,7 +125,9 @@ curl -s -X POST http://IP-СЕРВЕРА:3000/api/voice/calls \
 
 Из Claude Code звонок ставится скиллом `.claude/skills/ascn-call/SKILL.md` — он ищет номер в Контактах macOS или в интернете, спрашивает подтверждение и следит за звонком до итога. Чтобы скилл работал из любой папки, скопируйте его в `~/.claude/skills/ascn-call/`.
 
-Оба маршрута — API и скилл — авторизуются по `INTERNAL_API_KEY`. Этот ключ даёт право звонить с вашего номера, храните его как пароль.
+Оба маршрута — API и скилл — авторизуются отдельным
+`EXTERNAL_CALL_API_KEY`. Он даёт право только на API звонков default tenant и
+не открывает настройки, runtime или данные других тенантов.
 
 ## SIPNET
 
@@ -150,4 +164,7 @@ wss://voice.example.ru/voice-ws/session
 - `5060/udp,tcp` — SIP;
 - `10000-10100/udp` — RTP.
 
-Перед публикацией задайте в `.env` сильные `ADMIN_PASSWORD` и `INTERNAL_API_KEY`. Не удаляйте Docker volume: в нём находятся агенты, секреты, контакты и расшифровки.
+Перед публикацией заполните все обязательные значения из `.env.example`,
+настройте HTTPS и off-site backup по
+[`docs/BACKUP_AND_RESTORE.md`](docs/BACKUP_AND_RESTORE.md). Не удаляйте volumes
+PostgreSQL, MinIO и legacy: последний нужен для контролируемого отката миграции.

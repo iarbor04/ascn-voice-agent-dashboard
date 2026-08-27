@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Lint, build and integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: ascn_voice_test
+          POSTGRES_USER: ascn_test
+          POSTGRES_PASSWORD: ci-only-postgres-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ascn_test -d ascn_voice_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      CI: "true"
+      DATABASE_URL: postgresql://ascn_test:ci-only-postgres-password@127.0.0.1:5432/ascn_voice_test
+      REDIS_URL: redis://127.0.0.1:6379/0
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: ci-only-admin-password
+      GATEWAY_APP_KEY: ci-only-gateway-to-app-key
+      APP_GATEWAY_KEY: ci-only-app-to-gateway-key
+      BROWSER_TOKEN_SECRET: ci-only-browser-token-secret
+      EXTERNAL_CALL_API_KEY: ci-only-external-call-key
+      AMI_PASSWORD: ci-only-ami-password
+      TRUST_PROXY: "false"
+      ALLOW_PUBLIC_REGISTRATION: "true"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build and run integration tests
+        run: npm test
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
