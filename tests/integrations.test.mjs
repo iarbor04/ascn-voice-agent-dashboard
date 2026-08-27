@@ -289,3 +289,24 @@ test("ненастроенная интеграция не считается п
   assert.equal(amoDestination.configured(baseSettings), true);
   assert.equal(sheetsDestination.configured({ ...baseSettings, sheetsSpreadsheetId: "" }), false);
 });
+
+test("подписанная ссылка на запись пропускается middleware, и только она", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const proxy = await readFile(new URL("../proxy.ts", import.meta.url), "utf8");
+
+  // Без этой строки ссылка из карточки CRM отдаёт 401 вместо записи —
+  // на этом уже спотыкались при первом деплое.
+  assert.match(proxy, /pathname\.startsWith\(SIGNED_RECORDING_PREFIX\)\) return NextResponse\.next\(\)/);
+  assert.match(proxy, /SIGNED_RECORDING_PREFIX = "\/api\/voice\/recordings\/public\/"/);
+
+  // Открывать без сессии можно только вход, регистрацию, health и записи по подписи.
+  const listed = proxy.match(/const PUBLIC_PATHS = \[(.*?)\]/s)[1];
+  assert.deepEqual(
+    listed.split(",").map((item) => item.trim().replace(/"/g, "")).filter(Boolean),
+    ["/login", "/register", "/api/health"],
+  );
+
+  // Авторизованный маршрут записи обязан остаться под tenantRoute.
+  const guarded = await readFile(new URL("../app/api/voice/recordings/[id]/route.ts", import.meta.url), "utf8");
+  assert.match(guarded, /export const GET = tenantRoute\(handleGET\)/);
+});
