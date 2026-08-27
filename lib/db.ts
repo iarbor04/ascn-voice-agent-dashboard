@@ -222,6 +222,10 @@ async function migrateSchema(client: PoolClient) {
       ON ascn_call_campaign_recipients (tenant_id, call_id)
       WHERE call_id IS NOT NULL;
 
+    ALTER TABLE ascn_call_records
+      ADD COLUMN IF NOT EXISTS integrations jsonb NOT NULL DEFAULT '{}'::jsonb
+      CHECK (jsonb_typeof(integrations) = 'object');
+
     ALTER TABLE ascn_call_messages
       ADD COLUMN IF NOT EXISTS call_id text;
     CREATE INDEX IF NOT EXISTS ascn_call_messages_call_created_idx

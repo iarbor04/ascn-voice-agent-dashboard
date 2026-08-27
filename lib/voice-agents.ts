@@ -116,19 +116,36 @@ export type VoiceConnectionSettings = {
   smtpUser: string;
   smtpPassword: string;
   smtpFrom: string;
+  bitrixWebhookUrl: string;
+  amoBaseUrl: string;
+  amoAccessToken: string;
+  sheetsSpreadsheetId: string;
+  sheetsSheetName: string;
+  sheetsServiceAccountKey: string;
+  attachRecording: boolean;
   phoneConnections: PhoneConnection[];
 };
 
 export type SafePhoneConnection = Omit<PhoneConnection, "password"> & { passwordConfigured: boolean; password?: string };
-export type SafeVoiceSettings = Omit<VoiceConnectionSettings, "yandexApiKey" | "openaiApiKey" | "xaiApiKey" | "smtpPassword" | "phoneConnections"> & {
+export type SafeVoiceSettings = Omit<VoiceConnectionSettings, "yandexApiKey" | "openaiApiKey" | "xaiApiKey" | "smtpPassword" | "bitrixWebhookUrl" | "amoAccessToken" | "sheetsServiceAccountKey" | "phoneConnections"> & {
   yandexApiKeyConfigured: boolean;
   openaiApiKeyConfigured: boolean;
   xaiApiKeyConfigured: boolean;
   smtpPasswordConfigured: boolean;
+  bitrixWebhookConfigured: boolean;
+  amoAccessTokenConfigured: boolean;
+  sheetsServiceAccountConfigured: boolean;
+  // Общий ключ и секрет ссылок живут в окружении: панель должна объяснить,
+  // почему интеграция недоступна, а не молча её не выполнять.
+  sheetsSharedKeyAvailable: boolean;
+  recordingLinksAvailable: boolean;
   yandexApiKey?: string;
   openaiApiKey?: string;
   xaiApiKey?: string;
   smtpPassword?: string;
+  bitrixWebhookUrl?: string;
+  amoAccessToken?: string;
+  sheetsServiceAccountKey?: string;
   phoneConnections: SafePhoneConnection[];
 };
 
@@ -161,6 +178,13 @@ const defaultSettings: VoiceConnectionSettings = {
   smtpUser: "",
   smtpPassword: "",
   smtpFrom: "",
+  bitrixWebhookUrl: "",
+  amoBaseUrl: "",
+  amoAccessToken: "",
+  sheetsSpreadsheetId: "",
+  sheetsSheetName: "",
+  sheetsServiceAccountKey: "",
+  attachRecording: true,
   phoneConnections: [],
 };
 
@@ -424,6 +448,27 @@ function normalizePhoneConnection(value: unknown, existing?: PhoneConnection): P
   };
 }
 
+// Владелец таблицы копирует ссылку из адресной строки, а не идентификатор,
+// поэтому принимаем и то и другое.
+export function extractSpreadsheetId(value: string) {
+  const fromUrl = value.match(/\/spreadsheets\/d\/([A-Za-z0-9_-]+)/);
+  const id = fromUrl ? fromUrl[1] : value;
+  if (id && !/^[A-Za-z0-9_-]{20,200}$/.test(id)) throw new Error("Не удалось разобрать ссылку на таблицу Google");
+  return id;
+}
+
+// Ключ сервисного аккаунта проверяем при сохранении, а не при первом звонке:
+// иначе о опечатке в JSON узнаешь из провалившейся выгрузки.
+export function parseServiceAccountKey(raw: string) {
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { throw new Error("Ключ сервисного аккаунта должен быть JSON-файлом из Google Cloud"); }
+  const source = parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : {};
+  const clientEmail = typeof source.client_email === "string" ? source.client_email : "";
+  const privateKey = typeof source.private_key === "string" ? source.private_key : "";
+  if (!clientEmail || !privateKey.includes("PRIVATE KEY")) throw new Error("В ключе сервисного аккаунта нет client_email или private_key");
+  return { clientEmail, privateKey };
+}
+
 function normalizeSettings(value: unknown, existing: VoiceConnectionSettings) {
   if (!value || typeof value !== "object") throw new Error("Передайте настройки подключения");
   const source = value as Record<string, unknown>;
@@ -444,6 +489,16 @@ function normalizeSettings(value: unknown, existing: VoiceConnectionSettings) {
   if (new Set(phoneConnections.map((connection) => connection.id)).size !== phoneConnections.length) {
     throw new Error("Идентификаторы SIP-подключений не должны повторяться");
   }
+  const bitrixWebhookUrl = cleanSecret(source.bitrixWebhookUrl) || existing.bitrixWebhookUrl;
+  if (bitrixWebhookUrl && !/^https:\/\/[^\s/@]+\/rest\/\S*$/i.test(bitrixWebhookUrl)) {
+    throw new Error("Вебхук Bitrix24 должен быть ссылкой вида https://портал.bitrix24.ru/rest/1/токен/");
+  }
+  const amoBaseUrl = safe("amoBaseUrl", 200).replace(/\/+$/, "");
+  if (amoBaseUrl && !/^https:\/\/[a-z0-9-]+\.amocrm\.(ru|com)$/i.test(amoBaseUrl)) {
+    throw new Error("Адрес amoCRM должен быть вида https://ваш-аккаунт.amocrm.ru");
+  }
+  const sheetsServiceAccountKey = cleanSecret(source.sheetsServiceAccountKey, 8000) || existing.sheetsServiceAccountKey;
+  if (sheetsServiceAccountKey) parseServiceAccountKey(sheetsServiceAccountKey);
   return {
     yandexFolderId: safe("yandexFolderId", 100),
     yandexApiKey: cleanSecret(source.yandexApiKey) || existing.yandexApiKey,
@@ -456,6 +511,13 @@ function normalizeSettings(value: unknown, existing: VoiceConnectionSettings) {
     smtpUser: safe("smtpUser", 200),
     smtpPassword: cleanSecret(source.smtpPassword) || existing.smtpPassword,
     smtpFrom: safe("smtpFrom", 200),
+    bitrixWebhookUrl,
+    amoBaseUrl,
+    amoAccessToken: cleanSecret(source.amoAccessToken, 4000) || existing.amoAccessToken,
+    sheetsSpreadsheetId: extractSpreadsheetId(safe("sheetsSpreadsheetId", 400)),
+    sheetsSheetName: safe("sheetsSheetName", 100),
+    sheetsServiceAccountKey,
+    attachRecording: source.attachRecording === undefined ? existing.attachRecording : source.attachRecording !== false,
     phoneConnections,
   };
 }
@@ -475,6 +537,15 @@ function migrateSettings(value: unknown): VoiceConnectionSettings {
     smtpUser: typeof source.smtpUser === "string" ? source.smtpUser : "",
     smtpPassword: typeof source.smtpPassword === "string" ? source.smtpPassword : "",
     smtpFrom: typeof source.smtpFrom === "string" ? source.smtpFrom : "",
+    bitrixWebhookUrl: typeof source.bitrixWebhookUrl === "string" ? source.bitrixWebhookUrl : "",
+    amoBaseUrl: typeof source.amoBaseUrl === "string" ? source.amoBaseUrl : "",
+    amoAccessToken: typeof source.amoAccessToken === "string" ? source.amoAccessToken : "",
+    sheetsSpreadsheetId: typeof source.sheetsSpreadsheetId === "string" ? source.sheetsSpreadsheetId : "",
+    sheetsSheetName: typeof source.sheetsSheetName === "string" ? source.sheetsSheetName : "",
+    sheetsServiceAccountKey: typeof source.sheetsServiceAccountKey === "string" ? source.sheetsServiceAccountKey : "",
+    // Записи прикладываем по умолчанию: настройки, сохранённые до появления
+    // интеграций, не должны отключать выгрузку записи молча.
+    attachRecording: source.attachRecording !== false,
     phoneConnections: Array.isArray(source.phoneConnections) ? source.phoneConnections.map((item) => normalizePhoneConnection(item)) : [],
   };
   if (!base.phoneConnections.length && (source.sipRegistrar || source.sipNumber || source.sipUsername)) {
@@ -833,6 +904,15 @@ function getVoiceSettingsFromValue(settings: VoiceConnectionSettings) {
     smtpUser: settings.smtpUser,
     smtpFrom: settings.smtpFrom,
     smtpPasswordConfigured: Boolean(settings.smtpPassword),
+    bitrixWebhookConfigured: Boolean(settings.bitrixWebhookUrl),
+    amoBaseUrl: settings.amoBaseUrl,
+    amoAccessTokenConfigured: Boolean(settings.amoAccessToken),
+    sheetsSpreadsheetId: settings.sheetsSpreadsheetId,
+    sheetsSheetName: settings.sheetsSheetName,
+    sheetsServiceAccountConfigured: Boolean(settings.sheetsServiceAccountKey),
+    sheetsSharedKeyAvailable: Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_KEY?.trim()),
+    recordingLinksAvailable: Boolean(process.env.RECORDING_LINK_SECRET?.trim()),
+    attachRecording: settings.attachRecording,
     phoneConnections: settings.phoneConnections.map(({ password, ...connection }) => ({ ...connection, passwordConfigured: Boolean(password) })),
   };
 }

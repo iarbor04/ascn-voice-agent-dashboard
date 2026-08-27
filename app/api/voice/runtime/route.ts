@@ -1,4 +1,5 @@
 import { canonicalPhone, getAsteriskEndpoint, getVoiceSettings, normalizeCallVariables, providerTransport, resolveAgentInstructions, resolveInboundRoute, resolveOutboundRoute, resolveVoiceRoute, type VoiceTool } from "@/lib/voice-agents";
+import { exportCallInBackground } from "@/lib/integrations";
 import { createCallRecord, recordCallMetric, ensurePhoneContact, getCallRecord, getContact, listCallMessages, listCallTranscript, rememberPhoneNote, saveCallTranscript, transitionCallToTerminal, updateCallRecord, updateContactStatus, updatePhoneContact, type CallStatus } from "@/lib/calls";
 import { analyzeCallTranscript } from "@/lib/call-analysis";
 import { currentTenantId, DEFAULT_TENANT, withTenant } from "@/lib/tenant-context";
@@ -83,7 +84,10 @@ async function finishCall(callId: string, status: CallStatus, error: string) {
     const note = [outcome.summary, outcome.confirmation && `Подтверждение: ${outcome.confirmation}`, outcome.operator && `Сотрудник: ${outcome.operator}`, outcome.nextStep && `Дальше: ${outcome.nextStep}`].filter(Boolean).join(" · ");
     if (note) await rememberPhoneNote(call.phone, note);
   }
-  await notifyByMail(callId, outcome);
+  // Письмо и выгрузка в CRM идут в фоне: шлюз держит трубку и не должен ждать
+  // ни SMTP, ни три внешних API. Раньше письмо ждали, хотя комментарий обещал фон.
+  void notifyByMail(callId, outcome).catch((error) => console.error(`Письмо по звонку ${callId} не отправлено`, error));
+  exportCallInBackground(callId);
   return Response.json({ call: await getCallRecord(callId) });
 }
 

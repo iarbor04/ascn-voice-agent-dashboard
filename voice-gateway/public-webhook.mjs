@@ -96,13 +96,17 @@ async function resolvePublicAddress(hostname) {
   return addresses[0];
 }
 
-export async function postPublicWebhook(rawUrl, { authorization = "", payload, timeoutMs = 15_000 } = {}) {
+// Один запрос к чужому API с теми же гарантиями, что и у вебхуков: адрес
+// резолвится один раз и пинится в lookup, редиректы запрещены, размеры обрезаны.
+// Возвращает статус и тело как есть — решение по коду ответа принимает вызывающий,
+// потому что Bitrix и amoCRM описывают причину отказа в теле, а не в статусе.
+export async function callPublicApi(rawUrl, { method = "POST", headers = {}, body, contentType = "application/json", timeoutMs = 15_000 } = {}) {
   const url = new URL(rawUrl);
   if (url.protocol !== "https:" || url.username || url.password || !url.hostname) {
     throw new Error("Webhook must be a credential-free HTTPS URL");
   }
-  const body = Buffer.from(JSON.stringify(payload ?? {}));
-  if (body.length > MAX_REQUEST_BYTES) throw new Error("Webhook request is too large");
+  const payload = body === undefined || body === null ? null : Buffer.isBuffer(body) ? body : Buffer.from(typeof body === "string" ? body : JSON.stringify(body));
+  if (payload && payload.length > MAX_REQUEST_BYTES) throw new Error("Webhook request is too large");
   const target = await resolvePublicAddress(url.hostname);
 
   return new Promise((resolve, reject) => {
@@ -113,11 +117,10 @@ export async function postPublicWebhook(rawUrl, { authorization = "", payload, t
       callback(value);
     };
     const request = https.request(url, {
-      method: "POST",
+      method,
       headers: {
-        "content-type": "application/json",
-        "content-length": String(body.length),
-        ...(authorization ? { authorization } : {}),
+        ...(payload ? { "content-type": contentType, "content-length": String(payload.length) } : {}),
+        ...headers,
       },
       timeout: timeoutMs,
       maxHeaderSize: 16 * 1024,
@@ -140,15 +143,25 @@ export async function postPublicWebhook(rawUrl, { authorization = "", payload, t
       });
       response.on("end", () => {
         const text = Buffer.concat(chunks).toString("utf8");
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          finish(reject, new Error(`Webhook returned ${response.statusCode}`));
-          return;
-        }
-        try { finish(resolve, JSON.parse(text)); } catch { finish(resolve, { result: text }); }
+        let json = null;
+        try { json = JSON.parse(text); } catch { json = null; }
+        finish(resolve, { status: response.statusCode, text, json });
       });
     });
     request.on("timeout", () => request.destroy(new Error("Webhook timeout")));
     request.on("error", (error) => finish(reject, error));
-    request.end(body);
+    request.end(payload ?? undefined);
   });
+}
+
+// Прежний контракт вебхуков агента: бросает на любой не-2xx и отдаёт разобранный JSON.
+export async function postPublicWebhook(rawUrl, { authorization = "", payload, timeoutMs = 15_000 } = {}) {
+  const response = await callPublicApi(rawUrl, {
+    method: "POST",
+    headers: authorization ? { authorization } : {},
+    body: JSON.stringify(payload ?? {}),
+    timeoutMs,
+  });
+  if (response.status < 200 || response.status >= 300) throw new Error(`Webhook returned ${response.status}`);
+  return response.json ?? { result: response.text };
 }

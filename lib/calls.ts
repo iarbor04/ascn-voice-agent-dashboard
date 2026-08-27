@@ -6,7 +6,10 @@ export type Contact = { id: string; phone: string; name: string; language: strin
 export type CallMessage = { id: string; contactId: string; callId: string | null; direction: "inbound" | "outbound"; text: string; createdAt: string };
 export type CallStatus = "queued" | "dialing" | "live" | "ended" | "failed";
 export type CallOutcome = { resolved: boolean; summary: string; confirmation: string; operator: string; nextStep: string };
-export type CallRecord = { id: string; direction: "inbound" | "outbound"; phone: string; agentId: string; agentName: string; provider: string; model: string; status: CallStatus; variables: Record<string, string>; error: string; outcome: CallOutcome | null; firstAudioMs: number; toolCalls: number; transfers: number; toolUsage: Record<string, number>; recordedSeconds: number; createdAt: string; updatedAt: string; endedAt: string };
+// Итог выгрузки звонка во внешнюю систему. skipped значит «интеграция не
+// настроена» — это не ошибка и повторять её нечего.
+export type IntegrationStatus = { status: "sent" | "failed" | "skipped"; detail: string; entityId: string; at: string };
+export type CallRecord = { id: string; direction: "inbound" | "outbound"; phone: string; agentId: string; agentName: string; provider: string; model: string; status: CallStatus; variables: Record<string, string>; error: string; outcome: CallOutcome | null; firstAudioMs: number; toolCalls: number; transfers: number; toolUsage: Record<string, number>; recordedSeconds: number; integrations: Record<string, IntegrationStatus>; createdAt: string; updatedAt: string; endedAt: string };
 
 interface ContactRow extends QueryResultRow {
   id: string;
@@ -46,6 +49,7 @@ interface CallRow extends QueryResultRow {
   transfers: number;
   tool_usage: unknown;
   recorded_seconds: number;
+  integrations: unknown;
   created_at: Date | string;
   updated_at: Date | string;
   ended_at: Date | string | null;
@@ -54,7 +58,7 @@ interface CallRow extends QueryResultRow {
 const CONTACT_COLUMNS = "id, phone, name, language, status, last_message, updated_at, unread, notes";
 const CALL_COLUMNS = `id, direction, phone, agent_id, agent_name, provider, model, status,
   variables, error, outcome, first_audio_ms, tool_calls, transfers, tool_usage,
-  recorded_seconds, created_at, updated_at, ended_at`;
+  recorded_seconds, integrations, created_at, updated_at, ended_at`;
 
 function isoTimestamp(value: Date | string) {
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
@@ -75,6 +79,24 @@ function numberRecord(value: unknown): Record<string, number> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   return Object.fromEntries(
     Object.entries(value).filter((entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1])),
+  );
+}
+
+function integrationStatuses(value: unknown): Record<string, IntegrationStatus> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const allowed = new Set(["sent", "failed", "skipped"]);
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([key, raw]) => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+      const item = raw as Record<string, unknown>;
+      const status = typeof item.status === "string" && allowed.has(item.status) ? item.status as IntegrationStatus["status"] : "failed";
+      return [[key, {
+        status,
+        detail: typeof item.detail === "string" ? item.detail : "",
+        entityId: typeof item.entityId === "string" ? item.entityId : "",
+        at: typeof item.at === "string" ? item.at : "",
+      }]] as Array<[string, IntegrationStatus]>;
+    }),
   );
 }
 
@@ -133,6 +155,7 @@ function callFromRow(row: CallRow): CallRecord {
     transfers: Number(row.transfers) || 0,
     toolUsage: numberRecord(row.tool_usage),
     recordedSeconds: Number(row.recorded_seconds) || 0,
+    integrations: integrationStatuses(row.integrations),
     createdAt: isoTimestamp(row.created_at),
     updatedAt: isoTimestamp(row.updated_at),
     endedAt: row.ended_at ? isoTimestamp(row.ended_at) : "",
@@ -375,7 +398,7 @@ export async function listCallTranscript(callId: string) {
   return result.rows.map(messageFromRow);
 }
 
-export async function createCallRecord(record: Omit<CallRecord, "status" | "error" | "outcome" | "firstAudioMs" | "toolCalls" | "transfers" | "toolUsage" | "recordedSeconds" | "createdAt" | "updatedAt" | "endedAt">) {
+export async function createCallRecord(record: Omit<CallRecord, "status" | "error" | "outcome" | "firstAudioMs" | "toolCalls" | "transfers" | "toolUsage" | "recordedSeconds" | "integrations" | "createdAt" | "updatedAt" | "endedAt">) {
   const tenantId = currentTenantId();
   const now = new Date();
   const result = await databaseQuery<CallRow>(
@@ -478,6 +501,21 @@ export async function updateCallRecord(id: string, changes: Partial<Pick<CallRec
     );
     return callFromRow(result.rows[0]);
   });
+}
+
+// Итог выгрузки пишем точечно через jsonb_set: адаптеры работают параллельно,
+// и читать-менять-писать весь объект целиком означало бы терять чужой результат.
+// updated_at не трогаем — выгрузка не является изменением самого звонка.
+export async function recordIntegrationResult(id: string, destination: string, result: IntegrationStatus) {
+  const tenantId = currentTenantId();
+  const updated = await databaseQuery<CallRow>(
+    `UPDATE ascn_call_records
+     SET integrations = jsonb_set(COALESCE(integrations, '{}'::jsonb), ARRAY[$3], $4::jsonb, true)
+     WHERE tenant_id = $1 AND id = $2
+     RETURNING ${CALL_COLUMNS}`,
+    [tenantId, id, destination, JSON.stringify(result)],
+  );
+  return updated.rows[0] ? callFromRow(updated.rows[0]) : null;
 }
 
 export async function transitionCallToTerminal(id: string, status: "ended" | "failed", error = "") {
