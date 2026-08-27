@@ -1,6 +1,6 @@
-import type { CallOutcome, CallRecord } from "@/lib/calls";
-import type { VoiceConnectionSettings } from "@/lib/voice-agents";
-import { recordingUrl } from "@/lib/recording-link";
+import type { CallOutcome, CallRecord } from "../calls.ts";
+import type { VoiceConnectionSettings } from "../voice-agents.ts";
+import { recordingUrl } from "../recording-link.ts";
 
 // Всё, что уходит во внешнюю систему. Адаптеры видят только этот объект и
 // настройки — про базу и про звонок в трубке они не знают ничего.

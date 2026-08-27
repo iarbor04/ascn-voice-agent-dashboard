@@ -7,7 +7,7 @@ import { ArrowLeft, ArrowUp, AudioLines, BookOpen, Bot, Copy, Search, Briefcase,
 type Provider = "yandex" | "deepseek" | "openai" | "xai";
 type Transport = "yandex" | "openai" | "xai";
 function transportOf(provider: Provider): Transport { return provider === "openai" ? "openai" : provider === "xai" ? "xai" : "yandex"; }
-type Tool = { id: string; type: string; name?: string; vectorStoreId?: string; label?: string; url?: string; authorization?: string; authorizationConfigured?: boolean; requireApproval?: string; description?: string; parameters?: string; webhookUrl?: string };
+type Tool = { id: string; type: string; name?: string; vectorStoreId?: string; label?: string; url?: string; authorization?: string; authorizationConfigured?: boolean; allowedTools?: string[]; description?: string; parameters?: string; webhookUrl?: string };
 type Agent = {
   id: string; name: string; description: string; provider: Provider; model: string; instructions: string;
   variables: Array<{ id: string; key: string; value: string }>; tools: Tool[];
@@ -165,8 +165,12 @@ function toolCatalog(agent: Agent) {
   // Только то, что реально исполняется: веб-поиск и MCP xAI выполняет сам
   // (проверено живой сессией), у Яндекса исполнителя для них нет — не предлагаем.
   if (transportOf(agent.provider) === "xai" && !has("web_search")) entries.push({ key: "web_search", label: "Поиск в интернете", note: toolNotes.web_search, icon: <Search size={16} /> });
-  // MCP и свой webhook из каталога убраны по решению владельца (24.08.2026):
-  // «убери пока подключения». Механика в шлюзе живая — вернуть можно одной строкой.
+  // MCP исполняет сам провайдер, и принимают его только xAI и OpenAI Realtime
+  // (проверено живой сессией xAI 24.08.2026 и документацией OpenAI). У Yandex
+  // и DeepSeek исполнителя нет — там инструмент не предлагаем.
+  if (["xai", "openai"].includes(transportOf(agent.provider)) && !has("mcp")) {
+    entries.push({ key: "mcp", label: "Внешний MCP-сервер", note: toolNotes.mcp, icon: <Wrench size={16} /> });
+  }
   return entries;
 }
 
@@ -729,7 +733,13 @@ function AgentEditor({ agent, setAgent, settings, saving, onSave, onPublish, onA
       provider,
       model: models.find((model) => model.provider === provider)?.id || "",
       voice: provider === "openai" ? "marin" : provider === "xai" ? "xai_ara" : "filipp",
-      tools: provider === "openai" ? agent.tools.filter((tool) => tool.type !== "web_search" && tool.type !== "file_search") : provider === "xai" ? agent.tools.filter((tool) => tool.type !== "file_search" && tool.type !== "mcp") : agent.tools,
+      // MCP оставляем для xAI и OpenAI: оба его принимают. Yandex и DeepSeek — нет.
+      tools: agent.tools.filter((tool) => {
+        if (tool.type === "file_search") return provider !== "openai" && provider !== "xai";
+        if (tool.type === "web_search") return provider !== "openai";
+        if (tool.type === "mcp") return provider === "xai" || provider === "openai";
+        return true;
+      }),
     });
   }
   function addTool(key: string) {
@@ -741,7 +751,7 @@ function AgentEditor({ agent, setAgent, settings, saving, onSave, onPublish, onA
     else if (type === "dtmf") tool = { id: id(), type };
     else if (type === "web_search") tool = { id: id(), type };
     else if (type === "file_search") tool = { id: id(), type, vectorStoreId: "" };
-    else if (type === "mcp") tool = { id: id(), type, label: "mcp_server", url: "", authorization: "", requireApproval: "never" };
+    else if (type === "mcp") tool = { id: id(), type, label: "mcp_server", url: "", authorization: "", allowedTools: [] };
     else tool = { id: id(), type: "function", name: "my_function", description: "", parameters: "{\n  \"type\": \"object\",\n  \"properties\": {}\n}", webhookUrl: "", authorization: "" };
     patch({ tools: [...agent.tools, tool] });
   }
@@ -859,7 +869,7 @@ function AgentEditor({ agent, setAgent, settings, saving, onSave, onPublish, onA
 function ToolRow({ tool, used, onChange, onDelete }: { tool: Tool; used?: number; onChange: (changes: Partial<Tool>) => void; onDelete: () => void }) {
   const title = tool.type === "ascn" ? `ASCN · ${builtins.find(([value]) => value === tool.name)?.[1] || tool.name}` : tool.type === "dtmf" ? "Тональный набор (IVR)" : tool.type === "web_search" ? "Yandex Web Search" : tool.type === "file_search" ? "Yandex File Search" : tool.type === "mcp" ? "MCP-сервер" : "Своя функция";
   const note = toolNotes[tool.type === "ascn" ? String(tool.name) : tool.type] || "";
-  return <article className="tool-row"><header><span><Wrench size={15} /> {title}{typeof used === "number" && <i className={used ? "used" : ""}>{used ? `вызван ${used} раз` : "ещё не вызывался"}</i>}</span><button aria-label={`Удалить ${title}`} onClick={onDelete}><Trash2 size={15} /></button></header>{note && <p className="tool-note">{note}</p>}{tool.type === "file_search" && <label>ID поискового индекса<input value={tool.vectorStoreId || ""} onChange={(event) => onChange({ vectorStoreId: event.target.value })} placeholder="fvt..." /></label>}{tool.type === "mcp" && <div className="tool-fields"><label>Название<input value={tool.label || ""} onChange={(event) => onChange({ label: event.target.value })} /></label><label>URL сервера<input value={tool.url || ""} onChange={(event) => onChange({ url: event.target.value })} placeholder="https://..." /></label><label>Authorization<input type="password" value={tool.authorization || ""} onChange={(event) => onChange({ authorization: event.target.value })} placeholder={tool.authorizationConfigured ? "Уже сохранён" : "Bearer ..."} /></label><label>Подтверждение<select value={tool.requireApproval || "never"} onChange={(event) => onChange({ requireApproval: event.target.value })}><option value="never">Не требуется</option><option value="always">Всегда</option></select></label></div>}{tool.type === "function" && <div className="tool-fields"><label>Имя функции<input value={tool.name || ""} onChange={(event) => onChange({ name: event.target.value })} /></label><label>Webhook URL<input value={tool.webhookUrl || ""} onChange={(event) => onChange({ webhookUrl: event.target.value })} placeholder="https://..." /></label><label className="wide">Описание<input value={tool.description || ""} onChange={(event) => onChange({ description: event.target.value })} /></label><label className="wide">JSON Schema<textarea rows={4} value={tool.parameters || "{}"} onChange={(event) => onChange({ parameters: event.target.value })} /></label><label className="wide">Authorization<input type="password" value={tool.authorization || ""} onChange={(event) => onChange({ authorization: event.target.value })} placeholder={tool.authorizationConfigured ? "Уже сохранён" : "Необязательно"} /></label></div>}</article>;
+  return <article className="tool-row"><header><span><Wrench size={15} /> {title}{typeof used === "number" && <i className={used ? "used" : ""}>{used ? `вызван ${used} раз` : "ещё не вызывался"}</i>}</span><button aria-label={`Удалить ${title}`} onClick={onDelete}><Trash2 size={15} /></button></header>{note && <p className="tool-note">{note}</p>}{tool.type === "file_search" && <label>ID поискового индекса<input value={tool.vectorStoreId || ""} onChange={(event) => onChange({ vectorStoreId: event.target.value })} placeholder="fvt..." /></label>}{tool.type === "mcp" && <div className="tool-fields"><label>Название<input value={tool.label || ""} onChange={(event) => onChange({ label: event.target.value })} /></label><label>URL сервера<input value={tool.url || ""} onChange={(event) => onChange({ url: event.target.value })} placeholder="https://..." /></label><label>Authorization<input type="password" value={tool.authorization || ""} onChange={(event) => onChange({ authorization: event.target.value })} placeholder={tool.authorizationConfigured ? "Уже сохранён" : "Bearer ..."} /></label><label>Разрешённые инструменты<input value={(tool.allowedTools || []).join(", ")} onChange={(event) => onChange({ allowedTools: event.target.value.split(",").map((item) => item.trim()).filter(Boolean) })} placeholder="Пусто — все" /></label></div>}{tool.type === "function" && <div className="tool-fields"><label>Имя функции<input value={tool.name || ""} onChange={(event) => onChange({ name: event.target.value })} /></label><label>Webhook URL<input value={tool.webhookUrl || ""} onChange={(event) => onChange({ webhookUrl: event.target.value })} placeholder="https://..." /></label><label className="wide">Описание<input value={tool.description || ""} onChange={(event) => onChange({ description: event.target.value })} /></label><label className="wide">JSON Schema<textarea rows={4} value={tool.parameters || "{}"} onChange={(event) => onChange({ parameters: event.target.value })} /></label><label className="wide">Authorization<input type="password" value={tool.authorization || ""} onChange={(event) => onChange({ authorization: event.target.value })} placeholder={tool.authorizationConfigured ? "Уже сохранён" : "Необязательно"} /></label></div>}</article>;
 }
 
 function VoiceTester({ agent, settings, notify }: { agent: Agent; settings: Settings; notify: (message: string) => void }) {

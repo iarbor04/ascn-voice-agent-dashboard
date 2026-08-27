@@ -9,7 +9,7 @@ export type Tool = {
   url?: string;
   authorization?: string;
   authorizationConfigured?: boolean;
-  requireApproval?: string;
+  allowedTools?: string[];
   description?: string;
   parameters?: string;
   webhookUrl?: string;
@@ -93,8 +93,24 @@ export type VoiceSettings = {
   smtpPassword: string;
   smtpPasswordConfigured?: boolean;
   smtpFrom: string;
+  bitrixWebhookUrl: string;
+  bitrixWebhookConfigured?: boolean;
+  amoBaseUrl: string;
+  amoAccessToken: string;
+  amoAccessTokenConfigured?: boolean;
+  sheetsSpreadsheetId: string;
+  sheetsSheetName: string;
+  sheetsServiceAccountKey: string;
+  sheetsServiceAccountConfigured?: boolean;
+  // Приходят с backend только для чтения: общий ключ и секрет ссылок живут
+  // в окружении сервера, из панели их не задать.
+  sheetsSharedKeyAvailable?: boolean;
+  recordingLinksAvailable?: boolean;
+  attachRecording: boolean;
   phoneConnections: PhoneConnection[];
 };
+
+export type IntegrationStatus = { status: "sent" | "failed" | "skipped"; detail: string; entityId: string; at: string };
 
 export type Contact = { id: string; phone: string; name: string; language: string; status: string; lastMessage: string; updatedAt: string; unread: number };
 export type Message = { id: string; direction: "inbound" | "outbound"; text: string; createdAt: string };
@@ -113,6 +129,7 @@ export type CallRecord = {
   createdAt: string;
   endedAt: string;
   variables: Record<string, string>;
+  integrations?: Record<string, IntegrationStatus>;
 };
 
 export type CampaignRecipient = {

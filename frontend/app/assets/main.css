@@ -671,3 +671,27 @@ button,a { transition:background-color .14s ease, color .14s ease, border-color 
 .campaign-upload .campaign-file { display:grid; gap:8px; margin-bottom:14px; font-size:13px; font-weight:500 }
 .campaign-upload .campaign-file > span { display:inline-flex; align-items:center; gap:8px }
 .campaign-upload .campaign-file > small { color:var(--muted); font-size:12px; font-weight:400 }
+
+/* Интеграции: предупреждения и свой ключ */
+.integration-warning { margin:0 0 4px; padding:11px 14px; border-left:3px solid var(--accent); border-radius:8px; background:var(--accent-100); color:var(--text); font-size:12.5px; line-height:1.5 }
+.integration-warning code { padding:1px 5px; border-radius:4px; background:#fff; font-size:12px }
+.integration-advanced { margin:0 0 4px }
+.integration-advanced summary { cursor:pointer; color:var(--muted); font-size:13px; padding:4px 0 }
+.integration-advanced summary:hover { color:var(--text) }
+.integration-advanced textarea { width:100%; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px }
+.voice-settings-grid > small.wide { grid-column:1 / -1; color:var(--muted); font-size:12px; line-height:1.5 }
+
+/* Статус выгрузки звонка во внешние системы */
+.call-exports { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-top:12px }
+.export-chip { padding:4px 11px; border-radius:999px; background:var(--soft-pressed); color:var(--muted); font-size:12px; font-weight:500; cursor:default }
+.export-chip.sent { background:var(--accent-100); color:var(--accent-700) }
+.export-chip.failed { background:#fdf6f7; color:var(--red) }
+.call-exports .ghost-button { min-height:30px; padding:0 12px; font-size:12px; display:inline-flex; align-items:center; gap:6px }
+
+/* MCP-сервер в списке инструментов */
+.tool-row .tool-fields { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:12px; padding:14px 16px; border-top:1px solid var(--line-soft) }
+.tool-row .tool-fields label { display:grid; gap:6px; font-size:12px; color:var(--muted) }
+.tool-row .tool-fields label.wide, .tool-row .tool-fields small.wide { grid-column:1 / -1 }
+.tool-row .tool-fields small.wide { color:var(--muted); font-size:12px; line-height:1.5 }
+.tool-offer._muted { opacity:.55 }
+.tool-offer._muted p { color:var(--muted); font-size:12px; margin:2px 0 0 }

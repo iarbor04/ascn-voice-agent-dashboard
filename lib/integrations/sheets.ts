@@ -1,14 +1,12 @@
 import { createSign } from "node:crypto";
-import { parseServiceAccountKey, type VoiceConnectionSettings } from "@/lib/voice-agents";
-import { callPublicApi } from "../../voice-gateway/public-webhook.mjs";
+import { parseServiceAccountKey, type VoiceConnectionSettings } from "../voice-agents.ts";
+import { transport, type ApiResponse } from "./transport.ts";
 import { IntegrationError, type CallExport, type Destination } from "./types.ts";
 
 const SCOPE = "https://www.googleapis.com/auth/spreadsheets";
 const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 const SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets";
 const COLUMNS = "A:K";
-
-type GoogleResponse = { status: number; text: string; json: unknown };
 
 function base64url(value: string | Buffer) {
   return Buffer.from(value).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -34,10 +32,10 @@ async function accessToken(clientEmail: string, privateKey: string) {
   const signature = createSign("RSA-SHA256").update(unsigned).end().sign(privateKey);
   const assertion = `${unsigned}.${base64url(signature)}`;
 
-  const response = await callPublicApi(TOKEN_ENDPOINT, {
+  const response = await transport.call(TOKEN_ENDPOINT, {
     body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion }).toString(),
     contentType: "application/x-www-form-urlencoded",
-  }) as GoogleResponse;
+  }) as ApiResponse;
   const body = response.json && typeof response.json === "object" ? response.json as Record<string, unknown> : {};
   const token = typeof body.access_token === "string" ? body.access_token : "";
   if (!token) {
@@ -50,7 +48,7 @@ async function accessToken(clientEmail: string, privateKey: string) {
   return token;
 }
 
-function describeError(response: GoogleResponse) {
+function describeError(response: ApiResponse) {
   const body = response.json && typeof response.json === "object" ? response.json as Record<string, unknown> : {};
   const error = body.error && typeof body.error === "object" ? body.error as Record<string, unknown> : {};
   const message = typeof error.message === "string" ? error.message : "";
@@ -69,11 +67,11 @@ async function sheetsRequest(settings: VoiceConnectionSettings, path: string, op
   const key = resolveKey(settings);
   if (!key) throw new IntegrationError("Ключ сервисного аккаунта Google не настроен", 400);
   const token = await accessToken(key.clientEmail, key.privateKey);
-  const response = await callPublicApi(`${SHEETS_API}/${settings.sheetsSpreadsheetId}${path}`, {
+  const response = await transport.call(`${SHEETS_API}/${settings.sheetsSpreadsheetId}${path}`, {
     method: options.method || "GET",
     headers: { authorization: `Bearer ${token}` },
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
-  }) as GoogleResponse;
+  }) as ApiResponse;
   if (response.status < 200 || response.status >= 300) throw new IntegrationError(describeError(response), response.status);
   return response.json;
 }

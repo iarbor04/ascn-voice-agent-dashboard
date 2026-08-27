@@ -1,6 +1,6 @@
-import { getCallRecord, listCallTranscript, recordIntegrationResult, type IntegrationStatus } from "@/lib/calls";
-import { currentTenantId } from "@/lib/tenant-context";
-import { getVoiceSettings, type VoiceConnectionSettings } from "@/lib/voice-agents";
+import { getCallRecord, listCallTranscript, recordIntegrationResult, type IntegrationStatus } from "../calls.ts";
+import { currentTenantId } from "../tenant-context.ts";
+import { getVoiceSettings, type VoiceConnectionSettings } from "../voice-agents.ts";
 import { amoDestination } from "./amocrm.ts";
 import { bitrixDestination } from "./bitrix.ts";
 import { sheetsDestination } from "./sheets.ts";
@@ -26,27 +26,29 @@ function message(error: unknown) {
   return error instanceof Error ? error.message.slice(0, 500) : "Неизвестная ошибка выгрузки";
 }
 
-async function deliver(destination: Destination, call: CallExport, settings: VoiceConnectionSettings): Promise<IntegrationStatus> {
+async function deliver(destination: Destination, call: CallExport, settings: VoiceConnectionSettings, delays: number[]): Promise<IntegrationStatus> {
   const at = () => new Date().toISOString();
   for (let attempt = 0; ; attempt += 1) {
     try {
       const result = await destination.send(call, settings);
       return { status: "sent", detail: result.detail, entityId: result.entityId, at: at() };
     } catch (error) {
-      const canRetry = retriable(error) && attempt < RETRY_DELAYS.length;
+      const canRetry = retriable(error) && attempt < delays.length;
       if (!canRetry) {
         const attempts = attempt + 1;
         const suffix = attempts > 1 ? ` (попыток: ${attempts})` : "";
         return { status: "failed", detail: `${message(error)}${suffix}`, entityId: "", at: at() };
       }
-      await wait(RETRY_DELAYS[attempt]);
+      await wait(delays[attempt]);
     }
   }
 }
 
 // Выгрузка звонка во все настроенные системы. Ошибка одной не мешает другим,
 // поэтому Promise.allSettled, а не последовательный проход.
-export async function exportCall(callId: string) {
+// Повтор вручную идёт без пауз: человек нажал кнопку и ждёт ответа, а не
+// тридцати пяти секунд тишины.
+export async function exportCall(callId: string, { retry = true } = {}) {
   const call = await getCallRecord(callId);
   if (!call) return;
   const settings = await getVoiceSettings(false);
@@ -58,7 +60,7 @@ export async function exportCall(callId: string) {
   const payload = buildCallExport(call, dialogue, currentTenantId(), settings);
 
   await Promise.allSettled(active.map(async (destination) => {
-    const result = await deliver(destination, payload, settings);
+    const result = await deliver(destination, payload, settings, retry ? RETRY_DELAYS : []);
     // Результат нужен в панели даже когда выгрузка провалилась: иначе про
     // потерянный звонок никто не узнает.
     await recordIntegrationResult(callId, destination.id, result);

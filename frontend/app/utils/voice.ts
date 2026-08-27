@@ -42,7 +42,10 @@ export const templates = {
 
 export const emptySettings: VoiceSettings = {
   yandexFolderId: "", yandexApiKey: "", gatewayPublicUrl: "", openaiApiKey: "", openaiProjectId: "", xaiApiKey: "",
-  smtpHost: "", smtpPort: 587, smtpUser: "", smtpPassword: "", smtpFrom: "", phoneConnections: [],
+  smtpHost: "", smtpPort: 587, smtpUser: "", smtpPassword: "", smtpFrom: "",
+  bitrixWebhookUrl: "", amoBaseUrl: "", amoAccessToken: "",
+  sheetsSpreadsheetId: "", sheetsSheetName: "", sheetsServiceAccountKey: "",
+  attachRecording: true, phoneConnections: [],
 };
 
 export function uid() {

@@ -1,14 +1,12 @@
-import type { VoiceConnectionSettings } from "@/lib/voice-agents";
-import { callPublicApi } from "../../voice-gateway/public-webhook.mjs";
+import type { VoiceConnectionSettings } from "../voice-agents.ts";
+import { transport, type ApiResponse } from "./transport.ts";
 import { detailText, IntegrationError, type CallExport, type Destination } from "./types.ts";
 
 // Коды результата звонка в amoCRM: 4 — разговор состоялся, 6 — не дозвонились.
 const STATUS_TALKED = 4;
 const STATUS_NO_ANSWER = 6;
 
-type AmoResponse = { status: number; text: string; json: unknown };
-
-function describeError(response: AmoResponse) {
+function describeError(response: ApiResponse) {
   const body = response.json && typeof response.json === "object" ? response.json as Record<string, unknown> : {};
   const title = typeof body.title === "string" ? body.title : "";
   const detail = typeof body.detail === "string" ? body.detail : "";
@@ -19,11 +17,11 @@ function describeError(response: AmoResponse) {
 
 async function amo(settings: VoiceConnectionSettings, path: string, options: { method?: string; body?: unknown } = {}) {
   const url = `${settings.amoBaseUrl.replace(/\/+$/, "")}${path}`;
-  const response = await callPublicApi(url, {
+  const response = await transport.call(url, {
     method: options.method || "GET",
     headers: { authorization: `Bearer ${settings.amoAccessToken}` },
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
-  }) as AmoResponse;
+  }) as ApiResponse;
   // Пустой результат поиска amoCRM отдаёт как 204 без тела — это не ошибка.
   if (response.status === 204) return null;
   if (response.status < 200 || response.status >= 300) throw new IntegrationError(describeError(response), response.status);

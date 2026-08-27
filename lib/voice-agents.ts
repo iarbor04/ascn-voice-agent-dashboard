@@ -34,7 +34,10 @@ export type VoiceTool =
   | { id: string; type: "dtmf" }
   | { id: string; type: "web_search" }
   | { id: string; type: "file_search"; vectorStoreId: string }
-  | { id: string; type: "mcp"; label: string; url: string; authorization: string; requireApproval: "never" | "always" }
+  // requireApproval здесь нет намеренно: в телефонном звонке подтверждать вызов
+  // некому, и значение "always" повесило бы разговор в тишину до таймаута.
+  // allowedTools ограничивает, что именно агент может вызвать на сервере.
+  | { id: string; type: "mcp"; label: string; url: string; authorization: string; allowedTools: string[] }
   | { id: string; type: "function"; name: string; description: string; parameters: string; webhookUrl: string; authorization: string };
 
 // Снимок черновика: всё, что влияет на звонок. Имя, аватар и получатель писем
@@ -243,7 +246,10 @@ function normalizeTool(value: unknown, existing?: VoiceTool): VoiceTool | null {
       label: cleanText(source.label, 64) || "mcp",
       url,
       authorization: cleanSecret(source.authorization) || previous?.authorization || "",
-      requireApproval: source.requireApproval === "always" ? "always" : "never",
+      allowedTools: (Array.isArray(source.allowedTools) ? source.allowedTools : [])
+        .map((item) => cleanText(item, 64))
+        .filter((item) => /^[a-zA-Z][a-zA-Z0-9_.-]{0,63}$/.test(item))
+        .slice(0, 40),
     };
   }
   if (source.type === "function") {
@@ -655,7 +661,7 @@ async function persistAgent(client: PoolClient, tenantId: string, agent: VoiceAg
 function safeTools(tools: VoiceTool[]): SafeVoiceTool[] {
   return tools.map((tool) => {
     if (tool.type === "mcp") {
-      return { id: tool.id, type: tool.type, label: tool.label, url: tool.url, requireApproval: tool.requireApproval, authorizationConfigured: Boolean(tool.authorization) };
+      return { id: tool.id, type: tool.type, label: tool.label, url: tool.url, allowedTools: tool.allowedTools, authorizationConfigured: Boolean(tool.authorization) };
     }
     if (tool.type === "function") {
       return { id: tool.id, type: tool.type, name: tool.name, description: tool.description, parameters: tool.parameters, webhookUrl: tool.webhookUrl, authorizationConfigured: Boolean(tool.authorization) };

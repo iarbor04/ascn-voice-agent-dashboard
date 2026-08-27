@@ -40,6 +40,36 @@ function callDuration(call: CallRecord) {
 const activeId = computed(() => selected.value || contacts.value[0]?.id || "");
 const contact = computed(() => contacts.value.find((item) => item.id === activeId.value));
 const busy = computed(() => calls.value.some((call) => ["queued", "dialing", "live"].includes(call.status)));
+
+const resending = ref("");
+const destinationLabels: Record<string, string> = { bitrix: "Bitrix24", amocrm: "amoCRM", sheets: "Таблицы" };
+
+// Показываем только то, что реально пытались выгрузить. Ненастроенная
+// интеграция в списке звонка не появляется вовсе.
+function exportRows(call: CallRecord) {
+  return Object.entries(call.integrations || {})
+    .filter(([, value]) => value.status !== "skipped")
+    .map(([id, value]) => ({
+      id,
+      label: destinationLabels[id] || id,
+      status: value.status,
+      detail: value.detail,
+      text: value.status === "sent" ? "выгружен" : "не ушёл",
+    }));
+}
+
+async function resendExport(callId: string) {
+  resending.value = callId;
+  try {
+    await apiFetch(`/api/voice/calls/${callId}/export`, { method: "POST" });
+    await refresh();
+    notify("Выгрузка повторена");
+  } catch (failure) {
+    notify(failure instanceof Error ? failure.message : "Повторить выгрузку не удалось");
+  } finally {
+    resending.value = "";
+  }
+}
 const campaignBusy = computed(() => campaigns.value.some((campaign) => campaign.status === "running"));
 const visibleCalls = computed(() => calls.value.filter((call) => {
   if (filters.id && !call.id.toLowerCase().includes(filters.id.trim().toLowerCase())) return false;
@@ -392,6 +422,12 @@ onBeforeUnmount(() => { if (refreshTimer) clearInterval(refreshTimer); });
       <p v-if="call.variables?.caller_purpose" class="call-purpose">{{ call.variables.caller_purpose }}</p>
       <audio v-if="call.recordedSeconds > 0" class="call-audio" controls preload="none" :src="`/api/voice/recordings/${call.id}`"></audio>
       <p v-if="call.error" class="call-error">{{ call.error }}</p>
+      <div v-if="exportRows(call).length" class="call-exports">
+        <span v-for="row in exportRows(call)" :key="row.id" class="export-chip" :class="row.status" :title="row.detail">{{ row.label }}: {{ row.text }}</span>
+        <button v-if="exportRows(call).some((row) => row.status === 'failed')" class="ghost-button" :disabled="resending === call.id" @click="resendExport(call.id)">
+          <ListRestart :size="14" /> {{ resending === call.id ? "Отправляем…" : "Отправить снова" }}
+        </button>
+      </div>
       <div v-if="call.outcome" class="call-outcome"><strong>{{ call.outcome.resolved ? "Задача выполнена" : "Задача не закрыта" }}</strong><p v-if="call.outcome.summary">{{ call.outcome.summary }}</p><dl><template v-if="call.outcome.confirmation"><dt>Подтверждение</dt><dd>{{ call.outcome.confirmation }}</dd></template><template v-if="call.outcome.operator"><dt>Сотрудник</dt><dd>{{ call.outcome.operator }}</dd></template><template v-if="call.outcome.nextStep"><dt>Дальше</dt><dd>{{ call.outcome.nextStep }}</dd></template></dl></div>
     </article>
   </section>

@@ -1,14 +1,12 @@
-import type { VoiceConnectionSettings } from "@/lib/voice-agents";
-import { callPublicApi } from "../../voice-gateway/public-webhook.mjs";
+import type { VoiceConnectionSettings } from "../voice-agents.ts";
+import { transport, type ApiResponse } from "./transport.ts";
 import { detailText, IntegrationError, summaryLine, type CallExport, type Destination } from "./types.ts";
 
 // Идентификаторы типов владельца в CRM Bitrix: лид, сделка, контакт, компания.
 const OWNER_LEAD = 1;
 const OWNER_CONTACT = 3;
 
-type BitrixResponse = { status: number; text: string; json: unknown };
-
-function describeError(response: BitrixResponse) {
+function describeError(response: ApiResponse) {
   const body = response.json && typeof response.json === "object" ? response.json as Record<string, unknown> : {};
   const description = typeof body.error_description === "string" ? body.error_description : "";
   const code = typeof body.error === "string" ? body.error : "";
@@ -18,7 +16,7 @@ function describeError(response: BitrixResponse) {
 
 async function bitrix(webhook: string, method: string, params: Record<string, unknown>) {
   const base = webhook.replace(/\/+$/, "");
-  const response = await callPublicApi(`${base}/${method}.json`, { body: JSON.stringify(params) }) as BitrixResponse;
+  const response = await transport.call(`${base}/${method}.json`, { body: JSON.stringify(params) }) as ApiResponse;
   const body = response.json && typeof response.json === "object" ? response.json as Record<string, unknown> : {};
   if (response.status < 200 || response.status >= 300 || body.error) throw new IntegrationError(describeError(response), response.status);
   return body.result;

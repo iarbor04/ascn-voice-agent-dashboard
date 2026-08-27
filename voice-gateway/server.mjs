@@ -260,7 +260,14 @@ function toolDefinition(tool, provider) {
   if (tool.type === "dtmf") return { type: "function", name: "ascn_press_digit", description: "Набрать цифры в тональном меню (IVR). Допустимы 0-9, * и #. Используй, чтобы пройти автоответчик и дойти до живого сотрудника.", parameters: { type: "object", properties: { digits: { type: "string", description: "Цифры подряд, например 2 или 1#" } }, required: ["digits"], additionalProperties: false } };
   if (tool.type === "web_search") return { type: "function", name: "web_search", description: "Поиск в интернете", parameters: {} };
   if (tool.type === "file_search") return { type: "function", name: "file_search", description: tool.vectorStoreId, parameters: {} };
-  if (tool.type === "mcp") return { type: "mcp", server_label: tool.label, server_url: tool.url, authorization: tool.authorization, require_approval: tool.requireApproval };
+  if (tool.type === "mcp") {
+    // require_approval всегда never: подтверждать вызов в телефонном звонке
+    // некому, "always" повесил бы разговор в тишину до таймаута.
+    const definition = { type: "mcp", server_label: tool.label, server_url: tool.url, require_approval: "never" };
+    if (tool.authorization) definition.authorization = tool.authorization;
+    if (Array.isArray(tool.allowedTools) && tool.allowedTools.length) definition.allowed_tools = tool.allowedTools;
+    return definition;
+  }
   if (tool.type === "function") return { type: "function", name: tool.name, description: tool.description, parameters: JSON.parse(tool.parameters || "{}") };
   const definitions = {
     contact_context: { name: "ascn_contact_context", description: "Получить карточку клиента, историю сообщений и этапы воронки ASCN.", parameters: { type: "object", properties: {}, additionalProperties: false } },

@@ -1,6 +1,6 @@
-import { getCallRecord } from "@/lib/calls";
-import { currentTenantId } from "@/lib/tenant-context";
-import { getRecordingObject, ObjectStorageError } from "@/lib/object-storage";
+import { getCallRecord } from "./calls.ts";
+import { currentTenantId } from "./tenant-context.ts";
+import { getRecordingObject, ObjectStorageError } from "./object-storage.ts";
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import path from "node:path";

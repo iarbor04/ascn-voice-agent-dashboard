@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Bot, Briefcase, CalendarDays, Headphones, Plus, Search, Settings2, Trash2, TrendingUp, X } from "@lucide/vue";
+import { Bot, Briefcase, CalendarDays, Headphones, Plug, Plus, Search, Settings2, Trash2, TrendingUp, X } from "@lucide/vue";
 import type { Agent, PhoneConnection, VoiceSettings } from "~/types/voice";
 import { emptySettings, freshAgent, models, sinceText, templates, uid } from "~/utils/voice";
 
@@ -11,6 +11,7 @@ const search = ref("");
 const loading = ref(true);
 const saving = ref(false);
 const showSettings = ref(false);
+const showIntegrations = ref(false);
 const builder = ref<{ seed: string; starter?: () => Agent } | null>(null);
 
 const visibleAgents = computed(() => agents.value.filter((item) => {
@@ -33,6 +34,11 @@ function sanitizeSettings(result: VoiceSettings): VoiceSettings {
     openaiApiKey: "",
     xaiApiKey: "",
     smtpPassword: "",
+    // Секреты backend отдаёт только флагом «настроено». Пустая строка в черновике
+    // означает «не менять» — иначе сохранение затёрло бы сохранённый токен.
+    bitrixWebhookUrl: "",
+    amoAccessToken: "",
+    sheetsServiceAccountKey: "",
     phoneConnections: (result.phoneConnections || []).map((item) => ({ ...item, password: "" })),
   };
 }
@@ -126,9 +132,10 @@ onMounted(load);
 <template>
   <div v-if="loading" class="voice-loading">Загружаем голосовых агентов…</div>
   <ConnectionSettings v-else-if="showSettings" :agents="agents" :settings="settings" :saving="saving" @back="showSettings = false" @save="saveSettings" />
+  <IntegrationsSettings v-else-if="showIntegrations" :settings="settings" :saving="saving" @back="showIntegrations = false" @save="saveSettings" />
   <AgentEditor v-else-if="selected" :agent="selected" :settings="settings" :saving="saving" @back="selected = null" @save="saveAgent" @publish="publishAgent" @add-number="addPhoneNumber" />
   <template v-else>
-    <div class="page-header"><div><h1>Голосовые агенты</h1><p>Собрать, настроить и проверить голосового агента для телефона.</p></div><div class="page-actions"><button class="ghost-button" @click="showSettings = true"><Settings2 :size="16" /> Подключение и номера</button><button class="primary-button" @click="builder = { seed: '' }"><Plus :size="16" /> Создать агента</button></div></div>
+    <div class="page-header"><div><h1>Голосовые агенты</h1><p>Собрать, настроить и проверить голосового агента для телефона.</p></div><div class="page-actions"><button class="ghost-button" @click="showSettings = true"><Settings2 :size="16" /> Подключение и номера</button><button class="ghost-button" @click="showIntegrations = true"><Plug :size="16" /> Интеграции</button><button class="primary-button" @click="builder = { seed: '' }"><Plus :size="16" /> Создать агента</button></div></div>
     <div class="agent-search"><Search :size="15" /><input v-model="search" placeholder="Найти агента" aria-label="Найти агента"><button v-if="search" type="button" aria-label="Сбросить поиск" @click="search = ''"><X :size="14" /></button></div>
     <div v-if="agents.length" class="agent-table">
       <header><span>Агент</span><span>Модель</span><span>Изменён</span><i></i></header>
