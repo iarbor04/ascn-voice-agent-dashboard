@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { FileUp, ListRestart, Pause, PhoneCall, PhoneOutgoing, Play, Trash2, Users, X } from "@lucide/vue";
+import { FileDown, FileUp, ListRestart, Pause, PhoneCall, PhoneOutgoing, Play, Trash2, Users, X } from "@lucide/vue";
 import type { Agent, CallCampaign, CallRecord, Contact, Message, PhoneConnection, VoiceSettings } from "~/types/voice";
 
 const { notify } = useToast();
@@ -92,11 +92,53 @@ function toggleCampaignCreator() {
   if (campaignCreator.value) dialer.value = false;
 }
 
+type CampaignPreview = {
+  total: number;
+  invalid: number;
+  duplicates: number;
+  extraKeys: string[];
+  shown: number;
+  rows: Array<{ phone: string; name: string; purpose: string; extra: Record<string, string> }>;
+};
+
+const campaignPreview = ref<CampaignPreview | null>(null);
+const campaignPreviewError = ref("");
+const campaignPreviewLoading = ref(false);
+
+// Превью считает сервер тем же парсером, что и создание кампании,
+// поэтому таблица показывает ровно то, что попадёт в обзвон.
+async function loadCampaignPreview() {
+  campaignPreview.value = null;
+  campaignPreviewError.value = "";
+  if (!campaignFile.value) return;
+  campaignPreviewLoading.value = true;
+  try {
+    const body = new FormData();
+    body.set("file", campaignFile.value);
+    body.set("purposeTemplate", campaignForm.purposeTemplate);
+    campaignPreview.value = await apiFetch<CampaignPreview>("/api/voice/campaigns/preview", { method: "POST", body });
+  } catch (failure) {
+    campaignPreviewError.value = failure instanceof Error ? failure.message : "Не удалось разобрать CSV";
+  } finally {
+    campaignPreviewLoading.value = false;
+  }
+}
+
+// Общая задача подставляется в пустые purpose, поэтому после её правки
+// таблица должна пересчитаться — иначе она показывала бы устаревшее.
+let purposeTimer: ReturnType<typeof setTimeout> | undefined;
+watch(() => campaignForm.purposeTemplate, () => {
+  if (!campaignFile.value) return;
+  clearTimeout(purposeTimer);
+  purposeTimer = setTimeout(() => void loadCampaignPreview(), 500);
+});
+
 function selectCampaignFile(event: Event) {
   campaignFile.value = (event.target as HTMLInputElement).files?.[0] || null;
   if (campaignFile.value && !campaignForm.name.trim()) {
     campaignForm.name = campaignFile.value.name.replace(/\.csv$/i, "").replace(/[_-]+/g, " ").trim().slice(0, 120);
   }
+  void loadCampaignPreview();
 }
 
 function downloadCsvExample() {
@@ -105,8 +147,11 @@ function downloadCsvExample() {
   const link = document.createElement("a");
   link.href = url;
   link.download = "campaign-example.csv";
+  link.style.display = "none";
+  document.body.appendChild(link);
   link.click();
-  URL.revokeObjectURL(url);
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 async function createCampaign() {
@@ -126,6 +171,8 @@ async function createCampaign() {
     campaignCreator.value = false;
     Object.assign(campaignForm, { name: "", agentId: "", connectionId: "", purposeTemplate: "", interval: 5, unit: "minutes" });
     campaignFile.value = null;
+    campaignPreview.value = null;
+    campaignPreviewError.value = "";
     if (campaignFileInput.value) campaignFileInput.value.value = "";
     await loadCampaigns();
   } catch (failure) {
@@ -260,16 +307,57 @@ onBeforeUnmount(() => { if (refreshTimer) clearInterval(refreshTimer); });
   </section>
 
   <section v-if="campaignCreator" class="call-launcher campaign-launcher">
-    <header><div><h2>Новая кампания обзвона</h2><p>Загрузите CSV — агент будет брать по одному контакту через выбранный интервал.</p></div><button class="text-button" @click="downloadCsvExample">Скачать пример CSV</button></header>
+    <header><div><h2>Новая кампания обзвона</h2><p>Загрузите CSV — агент будет брать по одному контакту через выбранный интервал.</p></div><button class="ghost-button" @click="downloadCsvExample"><FileDown :size="15" /> Скачать пример CSV</button></header>
+    <div class="campaign-upload">
+      <label class="campaign-file"><span><FileUp :size="17" /> CSV-база</span><input ref="campaignFileInput" type="file" accept=".csv,text/csv" @change="selectCampaignFile"><small>{{ campaignFile ? `${campaignFile.name} · ${Math.ceil(campaignFile.size / 1024)} КБ` : "Колонки: phone/телефон, name/имя, purpose/задача. Остальные колонки станут переменными промпта." }}</small></label>
+    <div v-if="!campaignFile && !campaignPreviewLoading" class="campaign-preview _sample">
+      <header><strong>Так должен выглядеть файл</strong><small>Первая строка — заголовки колонок</small></header>
+      <div class="campaign-preview-scroll">
+        <table>
+          <thead><tr><th>phone</th><th>name</th><th>purpose</th><th>order_id</th></tr></thead>
+          <tbody>
+            <tr><td class="preview-phone">+79001234567</td><td>Иван</td><td>Подтвердить запись на завтра</td><td>A-101</td></tr>
+            <tr><td class="preview-phone">89007654321</td><td>Анна</td><td>Уточнить удобное время</td><td>A-102</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <small>Обязательна только колонка <code>phone</code> (или <code>телефон</code>). <code>name</code> и <code>purpose</code> — по желанию, любые другие колонки станут переменными промпта. Номера в любом формате: +7, 8, с пробелами и скобками.</small>
+    </div>
+    <div v-if="campaignPreviewLoading" class="campaign-preview _loading">Разбираю файл…</div>
+    <p v-else-if="campaignPreviewError" class="campaign-preview-error">{{ campaignPreviewError }}</p>
+    <div v-else-if="campaignPreview" class="campaign-preview">
+      <header>
+        <span class="preview-chip _ok">Загрузим {{ campaignPreview.total }}</span>
+        <span v-if="campaignPreview.duplicates" class="preview-chip">Дубликатов {{ campaignPreview.duplicates }}</span>
+        <span v-if="campaignPreview.invalid" class="preview-chip _warn">Без номера {{ campaignPreview.invalid }}</span>
+        <small v-if="campaignPreview.total > campaignPreview.shown">Показаны первые {{ campaignPreview.shown }} из {{ campaignPreview.total }}</small>
+      </header>
+      <div class="campaign-preview-scroll">
+        <table>
+          <thead><tr><th>#</th><th>Телефон</th><th>Имя</th><th>Задача звонка</th><th v-for="key in campaignPreview.extraKeys" :key="key">{{ key }}</th></tr></thead>
+          <tbody>
+            <tr v-for="(row, index) in campaignPreview.rows" :key="row.phone">
+              <td class="preview-index">{{ index + 1 }}</td>
+              <td class="preview-phone">{{ row.phone }}</td>
+              <td>{{ row.name || "—" }}</td>
+              <td class="preview-purpose">{{ row.purpose || "—" }}</td>
+              <td v-for="key in campaignPreview.extraKeys" :key="key">{{ row.extra[key] || "—" }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <small v-if="campaignPreview.extraKeys.length">Колонки {{ campaignPreview.extraKeys.join(", ") }} станут переменными промпта.</small>
+    </div>
+    </div>
+
     <div class="processing-grid">
       <label>Название кампании<input v-model="campaignForm.name" placeholder="Подтверждение записей"></label>
       <label>Агент<select v-model="campaignForm.agentId"><option value="">Выберите агента</option><option v-for="item in agents" :key="item.id" :value="item.id" :disabled="!item.active">{{ item.name }}{{ item.active ? "" : " (выключен)" }}</option></select></label>
       <label>SIP-номер<select v-model="campaignForm.connectionId"><option value="">Выберите подключение</option><option v-for="item in connections" :key="item.id" :value="item.id">{{ item.name }} · {{ item.number || item.username }}</option></select></label>
       <label>Интервал между звонками<div class="campaign-interval"><input v-model.number="campaignForm.interval" type="number" min="1" :max="campaignForm.unit === 'hours' ? 24 : 1440"><select v-model="campaignForm.unit"><option value="minutes">минут</option><option value="hours">часов</option></select></div></label>
       <label class="wide">Общая задача звонка <i>если в CSV нет колонки purpose</i><textarea v-model="campaignForm.purposeTemplate" rows="3" placeholder="Подтвердить запись и уточнить удобное время"></textarea></label>
-      <label class="wide campaign-file"><span><FileUp :size="17" /> CSV-база</span><input ref="campaignFileInput" type="file" accept=".csv,text/csv" @change="selectCampaignFile"><small>{{ campaignFile ? `${campaignFile.name} · ${Math.ceil(campaignFile.size / 1024)} КБ` : "Колонки: phone/телефон, name/имя, purpose/задача. Остальные колонки станут переменными промпта." }}</small></label>
     </div>
-    <footer><small>До 5000 уникальных номеров. Кампания создаётся на паузе — проверьте базу и нажмите «Запустить».</small><button class="primary-button" :disabled="campaignSaving || !campaignFile || !campaignForm.name.trim() || !campaignForm.agentId || !campaignForm.connectionId" @click="createCampaign">{{ campaignSaving ? "Загружаем…" : "Создать кампанию" }}</button></footer>
+    <footer><small>До 5000 уникальных номеров. Кампания создаётся на паузе — проверьте базу и нажмите «Запустить».</small><button class="primary-button" :disabled="campaignSaving || campaignPreviewLoading || !campaignPreview?.total || !campaignForm.name.trim() || !campaignForm.agentId || !campaignForm.connectionId" @click="createCampaign">{{ campaignSaving ? "Загружаем…" : "Создать кампанию" }}</button></footer>
   </section>
 
   <section v-if="campaigns.length" class="campaigns-section">

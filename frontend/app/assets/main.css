@@ -639,3 +639,35 @@ button,a { transition:background-color .14s ease, color .14s ease, border-color 
 .voice-lib-play { width:32px; height:32px; margin-right:6px; flex:0 0 auto; display:grid; place-items:center; border:1px solid var(--line); border-radius:999px; background:#fff; color:var(--ink); font-size:11px }
 .voice-lib-play:hover { background:var(--accent-100) }
 @media(max-width:720px){.campaign-recipient-head{display:none}.campaign-recipient-row{grid-template-columns:1fr auto}.campaign-recipient-row>span:nth-child(2){text-align:right}.campaign-recipient-row>span:nth-child(4){display:none}.campaign-grid{grid-template-columns:1fr}.campaign-counts{flex-wrap:wrap}.campaign-main{flex-wrap:wrap}.campaign-main small{width:100%;margin-left:0}}
+
+/* Превью CSV-базы кампании */
+.campaign-preview { margin-top:16px; border:1px solid var(--line); border-radius:var(--radius); background:#fff }
+.campaign-preview._loading { padding:16px 18px; color:var(--muted); font-size:13px }
+.campaign-preview > header { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:14px 16px; border-bottom:1px solid var(--line-soft) }
+.campaign-preview > header small { margin-left:auto; color:var(--muted); font-size:12px }
+.preview-chip { padding:4px 11px; border-radius:999px; background:var(--soft-pressed); color:var(--muted); font-size:12px; font-weight:500 }
+.preview-chip._ok { background:var(--accent-100); color:var(--accent-700) }
+.preview-chip._warn { background:#fdf3e0; color:#b57612 }
+.campaign-preview-scroll { max-height:340px; overflow:auto }
+.campaign-preview table { width:100%; border-collapse:collapse; font-size:13px }
+.campaign-preview th, .campaign-preview td { padding:9px 12px; text-align:left; border-bottom:1px solid var(--line-soft); vertical-align:top }
+.campaign-preview thead th { position:sticky; top:0; background:#fff; color:var(--muted); font-size:11px; font-weight:500; letter-spacing:.04em; text-transform:uppercase; white-space:nowrap }
+.campaign-preview tbody tr:hover { background:var(--soft) }
+.preview-index { width:38px; color:var(--muted); font-variant-numeric:tabular-nums }
+.preview-phone { font-variant-numeric:tabular-nums; white-space:nowrap; font-weight:500 }
+.preview-purpose { max-width:360px }
+.campaign-preview > small { display:block; padding:10px 16px 14px; color:var(--muted); font-size:12px }
+.campaign-preview-error { margin:16px 0 0; padding:13px 16px; border-left:3px solid var(--red); border-radius:8px; background:#fdf6f7; color:var(--red); font-size:13px }
+.campaign-preview._sample { background:var(--soft) }
+.campaign-preview._sample thead th { background:var(--soft); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; text-transform:none; letter-spacing:0; font-size:12px }
+.campaign-preview._sample tbody td { color:var(--muted) }
+.campaign-preview._sample > header strong { font-size:14px; font-weight:500 }
+.campaign-preview._sample > header small { margin-left:auto; color:var(--muted); font-size:12px }
+.campaign-preview._sample code { padding:1px 5px; border-radius:4px; background:#fff; font-size:12px }
+.campaign-launcher > header .ghost-button { flex:0 0 auto; display:inline-flex; align-items:center; gap:7px; min-height:38px; white-space:nowrap }
+.campaign-file input[type=file] { padding:10px 12px; border:1px dashed var(--line-bold); border-radius:10px; background:var(--soft); width:100%; cursor:pointer; font-size:13px }
+.campaign-file input[type=file]:hover { border-color:var(--accent); background:var(--accent-100) }
+.campaign-upload { display:grid; gap:0; margin-bottom:20px }
+.campaign-upload .campaign-file { display:grid; gap:8px; margin-bottom:14px; font-size:13px; font-weight:500 }
+.campaign-upload .campaign-file > span { display:inline-flex; align-items:center; gap:8px }
+.campaign-upload .campaign-file > small { color:var(--muted); font-size:12px; font-weight:400 }
